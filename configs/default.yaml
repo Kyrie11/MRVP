@@ -1,0 +1,63 @@
+# MRVP default hyperparameters matching the paper appendix checklist.
+scenario_generation:
+  number_of_root_scenarios: 1000
+  actions_per_root: 8
+  action_library:
+    - hard_brake
+    - brake_left
+    - brake_right
+    - maintain
+    - mild_left
+    - mild_right
+    - boundary_side_steer
+    - corridor_side_steer
+harm_gate:
+  harm_surrogate: impulse_or_delta_v
+  bin_thresholds: [0.5, 2.0, 4.0, 7.0, 11.0]
+transition_extraction:
+  K: 4
+  epsilon_v: 0.8
+  epsilon_r: 0.4
+  delta_max: 0.8
+boundary_transition:
+  eps:
+    road: 0.25
+    stability: 0.15
+    control: 0.10
+    secondary: 1.0
+    return: 2.0
+  sigma:
+    road: 0.25
+    stability: 0.25
+    control: 0.20
+    secondary: 2.0
+    return: 4.0
+  delta: 0.2
+msrt:
+  mixture_count: 5
+  hidden_dim: 256
+  lambda_mech: 1.0
+  lambda_phys: 0.2
+  lambda_suf: 0.0
+  lambda_inv: 0.0
+rpn:
+  hidden_dim: 256
+  lambda_act: 0.5
+  lambda_bd: 2.0
+  sigma_bd: 0.5
+  lambda_mono: 0.0
+pair_mining:
+  epsilon_s: 0.25
+  margin: 0.05
+calibration:
+  delta_b: 0.02
+  n_min: 20
+selection:
+  transition_samples: 32
+  beta: 0.9
+recovery_teacher:
+  horizon: 5.0
+  dt: 0.1
+closed_loop:
+  control_frequency_hz: 20
+  mrvp_selection_frequency_hz: 10
