@@ -468,6 +468,12 @@ def _rollout_metadrive(scene: RootScene, action_vec: np.ndarray, dt: float = 0.0
         "num_scenarios": 1,
         "log_level": 50,
         "image_observation": False,
+
+        "crash_vehicle_done": False,
+        "crash_object_done": False,
+        "crash_human_done": False,
+        "out_of_road_done": False,
+
         "vehicle_config": {"show_navi_mark": False},
     }
     env = MetaDriveEnv(config)
