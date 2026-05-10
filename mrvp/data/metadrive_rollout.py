@@ -457,28 +457,8 @@ def _md_agent_state(env: Any, t: float, steer: float = 0.0) -> np.ndarray:
     beta = float(getattr(agent, "beta", 0.0))
     return _state_vec(x, y, yaw, speed, yaw_rate, beta, steer, t)
 
-def _make_metadrive_env(scene: RootScene):
-    MetaDriveEnv = _try_import_metadrive_env()
-    config = {
-        "use_render": False,
-        "manual_control": False,
-        "traffic_density": float(scene.actor_density),
-        "start_seed": int(scene.seed),
-        "num_scenarios": 1,
-        "log_level": 50,
-        "image_observation": False,
 
-        # 关键：为了能观察 post-transition recovery，不要一撞就结束
-        "crash_vehicle_done": False,
-        "crash_object_done": False,
-        "crash_human_done": False,
-        "out_of_road_done": False,
-
-        "vehicle_config": {"show_navi_mark": False},
-    }
-    return MetaDriveEnv(config)
-
-def _rollout_metadrive_with_env(env: Any, scene: RootScene, action_vec: np.ndarray, dt: float = 0.05, recovery_horizon: float = 4.0) -> RolloutResult:
+def _rollout_metadrive(scene: RootScene, action_vec: np.ndarray, dt: float = 0.05, recovery_horizon: float = 4.0) -> RolloutResult:  # pragma: no cover - optional simulator
     MetaDriveEnv = _try_import_metadrive_env()
     config = {
         "use_render": False,
@@ -744,12 +724,7 @@ def make_metadrive_rows(
             action_id = a % len(ACTION_NAMES)
             action_vec = ACTION_VECTORS[action_id].astype(np.float32)
             if selected_backend == "metadrive":
-                env = _make_metadrive_env(scene)
-                try:
-                    for a in range(actions_per_root):
-                        result = _rollout_metadrive_with_env(env, scene, action_vec)
-                finally:
-                    env.close()
+                result = _rollout_metadrive(scene, action_vec)
             elif selected_backend == "light2d":
                 result = _rollout_light2d(scene, action_vec)
             else:
