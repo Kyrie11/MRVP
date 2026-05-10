@@ -747,7 +747,7 @@ def make_metadrive_rows(
                 env = _make_metadrive_env(scene)
                 try:
                     for a in range(actions_per_root):
-                        result = _rollout_metadrive(scene, action_vec)
+                        result = _rollout_metadrive_with_env(env, scene, action_vec)
                 finally:
                     env.close()
             elif selected_backend == "light2d":
