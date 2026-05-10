@@ -547,7 +547,7 @@ python diagnose_residual_action.py \
 ## 10. 单 root 动作选择
 
 ```bash
-python select.py \
+python run_select.py \
   --data data/metadrive_mrvp.jsonl \
   --root-id light2d_000220 \
   --split test \
