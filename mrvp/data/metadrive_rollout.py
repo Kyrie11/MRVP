@@ -88,6 +88,90 @@ def _split_for_root(i: int, n_roots: int) -> str:
         return "cal"
     return "test"
 
+def write_rows_streaming(
+    output: str | Path,
+    n_roots: int,
+    actions_per_root: int = NUM_ACTIONS,
+    seed: int = 7,
+    backend: str = "auto",
+    shift_test: bool = True,
+    harm_thresholds: Sequence[float] = (0.5, 2.0, 4.0, 7.0, 11.0),
+    log_every: int = 10,
+) -> None:
+    rng = np.random.default_rng(seed)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    selected_backend = backend
+    if backend == "auto":
+        try:
+            _try_import_metadrive_env()
+            selected_backend = "metadrive"
+        except ImportError:
+            selected_backend = "light2d"
+
+    split_counts: Dict[str, int] = {}
+    backend_counts: Dict[str, int] = {}
+    done_counts: Dict[str, int] = {}
+
+    with output.open("w", encoding="utf-8") as f:
+        for i in range(n_roots):
+            scene = _make_root_scene(i, n_roots, rng, seed=seed, shift_test=shift_test)
+            scene.root_id = f"{selected_backend}_{i:06d}"
+
+            for a in range(actions_per_root):
+                action_id = a % len(ACTION_NAMES)
+                action_vec = ACTION_VECTORS[action_id].astype(np.float32)
+
+                if selected_backend == "metadrive":
+                    result = _rollout_metadrive(scene, action_vec)
+                elif selected_backend == "light2d":
+                    result = _rollout_light2d(scene, action_vec)
+                else:
+                    raise ValueError(f"Unknown backend {backend!r}.")
+
+                row = _row_from_rollout(scene, action_id, result, harm_thresholds)
+                row["backend"] = selected_backend
+
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                f.flush()
+
+                split_counts[row["split"]] = split_counts.get(row["split"], 0) + 1
+                backend_counts[row["backend"]] = backend_counts.get(row["backend"], 0) + 1
+                reason = row["calib_group"]["done_reason"]
+                done_counts[reason] = done_counts.get(reason, 0) + 1
+
+            if (i + 1) % log_every == 0 or i == 0 or i + 1 == n_roots:
+                print(
+                    json.dumps(
+                        {
+                            "progress": f"{i + 1}/{n_roots}",
+                            "rows_written": (i + 1) * actions_per_root,
+                            "backend": selected_backend,
+                            "splits": split_counts,
+                            "done_reason": done_counts,
+                            "output": str(output),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+
+    print(
+        json.dumps(
+            {
+                "finished": True,
+                "output": str(output),
+                "rows": n_roots * actions_per_root,
+                "splits": split_counts,
+                "backend": backend_counts,
+                "done_reason": done_counts,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
 def _state_vec(x: float, y: float, yaw: float, speed: float, yaw_rate: float, beta: float, steer: float, t: float) -> np.ndarray:
     out = np.zeros(STATE_DIM, dtype=np.float32)
@@ -373,8 +457,28 @@ def _md_agent_state(env: Any, t: float, steer: float = 0.0) -> np.ndarray:
     beta = float(getattr(agent, "beta", 0.0))
     return _state_vec(x, y, yaw, speed, yaw_rate, beta, steer, t)
 
+def _make_metadrive_env(scene: RootScene):
+    MetaDriveEnv = _try_import_metadrive_env()
+    config = {
+        "use_render": False,
+        "manual_control": False,
+        "traffic_density": float(scene.actor_density),
+        "start_seed": int(scene.seed),
+        "num_scenarios": 1,
+        "log_level": 50,
+        "image_observation": False,
 
-def _rollout_metadrive(scene: RootScene, action_vec: np.ndarray, dt: float = 0.05, recovery_horizon: float = 4.0) -> RolloutResult:  # pragma: no cover - optional simulator
+        # 关键：为了能观察 post-transition recovery，不要一撞就结束
+        "crash_vehicle_done": False,
+        "crash_object_done": False,
+        "crash_human_done": False,
+        "out_of_road_done": False,
+
+        "vehicle_config": {"show_navi_mark": False},
+    }
+    return MetaDriveEnv(config)
+
+def _rollout_metadrive_with_env(env: Any, scene: RootScene, action_vec: np.ndarray, dt: float = 0.05, recovery_horizon: float = 4.0) -> RolloutResult:
     MetaDriveEnv = _try_import_metadrive_env()
     config = {
         "use_render": False,
@@ -640,7 +744,12 @@ def make_metadrive_rows(
             action_id = a % len(ACTION_NAMES)
             action_vec = ACTION_VECTORS[action_id].astype(np.float32)
             if selected_backend == "metadrive":
-                result = _rollout_metadrive(scene, action_vec)
+                env = _make_metadrive_env(scene)
+                try:
+                    for a in range(actions_per_root):
+                        result = _rollout_metadrive(scene, action_vec)
+                finally:
+                    env.close()
             elif selected_backend == "light2d":
                 result = _rollout_light2d(scene, action_vec)
             else:
@@ -659,22 +768,21 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--backend", choices=["auto", "metadrive", "light2d"], default="auto")
     parser.add_argument("--no-shift-test", action="store_true", help="Disable harder friction/density/damage distribution for test roots.")
+    parser.add_argument("--log-every", type=int, default=10)
     args = parser.parse_args()
-    rows = make_metadrive_rows(
+
+
+
+    write_rows_streaming(
+        output=args.output,
         n_roots=args.n_roots,
         actions_per_root=args.actions_per_root,
         seed=args.seed,
         backend=args.backend,
         shift_test=not args.no_shift_test,
+        log_every=args.log_every,
     )
-    write_jsonl(rows, args.output)
-    split_counts: Dict[str, int] = {}
-    backend_counts: Dict[str, int] = {}
-    for row in rows:
-        split_counts[row["split"]] = split_counts.get(row["split"], 0) + 1
-        backend_counts[row["backend"]] = backend_counts.get(row["backend"], 0) + 1
-    print(json.dumps({"output": args.output, "rows": len(rows), "splits": split_counts, "backend": backend_counts}, indent=2, ensure_ascii=False))
-
+    return
 
 if __name__ == "__main__":
     main()
