@@ -27,6 +27,12 @@ def build_profile_model(model_type: str, hidden_dim: int, scalar_rpn: bool = Fal
     raise ValueError(f"Unknown model_type: {model_type}")
 
 
+def auto_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate MRVP and paper baselines on a held-out split.")
     parser.add_argument("--data", required=True)
@@ -35,23 +41,24 @@ def main() -> None:
     parser.add_argument("--split", default="test")
     parser.add_argument("--output", default="runs/default/eval_test.json")
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--scalar-rpn", action="store_true")
     parser.add_argument("--model-type", choices=["rpn", "direct_action_to_risk", "unstructured_latent"], default="rpn")
     parser.add_argument("--torch-threads", type=int, default=1)
     args = parser.parse_args()
     torch.set_num_threads(max(1, args.torch_threads))
+    device = auto_device(args.device)
     ds = MRVPDataset(args.data, split=args.split)
     results = {}
     if args.rpn:
         model = build_profile_model(args.model_type, args.hidden_dim, args.scalar_rpn)
-        load_model(model, args.rpn, args.device, strict=False)
-        r_hat = predict_rpn(model, ds, batch_size=args.batch_size, device=args.device)
+        load_model(model, args.rpn, device, strict=False)
+        r_hat = predict_rpn(model, ds, batch_size=args.batch_size, device=device)
         table = load_calibration_table(args.calibration or None)
         lower = lower_bounds_for_rows(r_hat, ds.rows, table)
-        results["MRVP"] = evaluate_selection(ds.rows, lower, r_hat)
-        results["Uncalibrated_MRVP"] = evaluate_selection(ds.rows, r_hat, r_hat)
+        results["Oracle_MRVP_true_transition"] = evaluate_selection(ds.rows, lower, r_hat)
+        results["Uncalibrated_Oracle_MRVP"] = evaluate_selection(ds.rows, r_hat, r_hat)
         mean_lower = np.repeat(lower.mean(axis=1, keepdims=True), lower.shape[1], axis=1)
         results["Scalar_recoverability_network_proxy"] = evaluate_selection(ds.rows, mean_lower, mean_lower)
     for name, kind in [("Severity_only", "severity"), ("Weighted_post_impact_cost", "weighted_post_impact"), ("Teacher_oracle", "teacher_oracle")]:

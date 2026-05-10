@@ -32,6 +32,7 @@ def group_indices_by_root(rows: Sequence[Mapping[str, Any]]) -> Dict[str, List[i
 def pair_accuracy(rows: Sequence[Mapping[str, Any]], scores: np.ndarray, eps_s: float = 0.25) -> float:
     total = 0
     correct = 0
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
     for _, idxs in group_indices_by_root(rows).items():
         by_bin = defaultdict(list)
         for i in idxs:
@@ -39,6 +40,8 @@ def pair_accuracy(rows: Sequence[Mapping[str, Any]], scores: np.ndarray, eps_s: 
         for group in by_bin.values():
             for p, i in enumerate(group):
                 for j in group[p + 1 :]:
+                    if not (np.isfinite(scores[i]) and np.isfinite(scores[j])):
+                        continue
                     ds = float(rows[i]["s_star"]) - float(rows[j]["s_star"])
                     if abs(ds) < eps_s:
                         continue
@@ -127,3 +130,81 @@ def baseline_scores(rows: Sequence[Mapping[str, Any]], kind: str = "severity") -
 def lower_bounds_from_scalar_scores(rows: Sequence[Mapping[str, Any]], scores: np.ndarray) -> np.ndarray:
     """Convert scalar baseline scores to a fake lower profile for common metrics."""
     return np.repeat(scores[:, None], len(BOTTLE_NECKS), axis=1)
+
+
+def evaluate_selected_indices(
+    rows: Sequence[Mapping[str, Any]],
+    selected_indices: Sequence[int],
+    scores: np.ndarray | None = None,
+    lower_bounds: np.ndarray | None = None,
+    eps_s: float = 0.25,
+) -> Dict[str, float]:
+    """Evaluate a selector after it has already chosen one action per root.
+
+    ``selected_indices`` must contain global row indices in ``rows``. This is
+    used for Predicted-MRVP where a root-level selector samples MSRT and applies
+    CVaR, so the decision cannot be represented faithfully as one deterministic
+    lower-bound profile per action. Optional ``scores`` still allow pair-order
+    diagnostics; optional ``lower_bounds`` allows coverage/active-bottleneck
+    diagnostics based on mean predicted lower profiles.
+    """
+    by_root = group_indices_by_root(rows)
+    selected_set = set(int(i) for i in selected_indices)
+    selected = []
+    envelope_viol = []
+    violation_depth = []
+    recovery_success = []
+    regrets = []
+    frr_num = 0
+    frr_den = 0
+    for _, idxs in by_root.items():
+        chosen = [i for i in idxs if i in selected_set]
+        if not chosen:
+            continue
+        global_idx = chosen[0]
+        selected.append(global_idx)
+        min_bin = min(int(rows[i]["harm_bin"]) for i in idxs)
+        envelope_viol.append(int(rows[global_idx]["harm_bin"] != min_bin))
+        s = float(rows[global_idx]["s_star"])
+        violation_depth.append(max(-s, 0.0))
+        recovery_success.append(int(s >= 0.0))
+        adm = [i for i in idxs if int(rows[i]["harm_bin"]) == min_bin]
+        oracle = max(float(rows[i]["s_star"]) for i in adm)
+        regrets.append(max(0.0, oracle - s))
+        if lower_bounds is not None:
+            v_lower = float(np.asarray(lower_bounds)[global_idx].min())
+            frr_den += int(v_lower > 0.0)
+            frr_num += int(v_lower > 0.0 and s < 0.0)
+    out = {
+        "roots": float(len(selected)),
+        "actions": float(len(rows)),
+        "envelope_violation": float(np.mean(envelope_viol)) if envelope_viol else float("nan"),
+        "frr": float(frr_num / max(frr_den, 1)) if lower_bounds is not None else float("nan"),
+        "worst_bottleneck_violation_depth": float(np.mean(violation_depth)) if violation_depth else float("nan"),
+        "closed_loop_recovery_success_proxy": float(np.mean(recovery_success)) if recovery_success else float("nan"),
+        "shift_regret": float(np.mean(regrets)) if regrets else float("nan"),
+    }
+    if scores is not None:
+        out["pair_accuracy"] = pair_accuracy(rows, scores, eps_s=eps_s)
+    else:
+        out["pair_accuracy"] = float("nan")
+    if lower_bounds is not None:
+        lower_arr = np.asarray(lower_bounds, dtype=np.float32)
+        coverage_hits = np.zeros(len(BOTTLE_NECKS), dtype=np.float64)
+        coverage_tot = np.zeros(len(BOTTLE_NECKS), dtype=np.float64)
+        for i, row in enumerate(rows):
+            r_star = np.asarray(row["r_star"], dtype=np.float32)
+            coverage_hits += (r_star >= lower_arr[i]).astype(np.float64)
+            coverage_tot += 1
+        pred_b = np.argmin(lower_arr, axis=1)
+        true_b = np.asarray([int(r["b_star"]) for r in rows])
+        out["active_bottleneck_f1"] = macro_f1(true_b, pred_b, len(BOTTLE_NECKS))
+        out["coverage"] = float(np.mean(coverage_hits / np.maximum(coverage_tot, 1)))
+        for b, name in enumerate(BOTTLE_NECKS):
+            out[f"coverage_{name}"] = float(coverage_hits[b] / max(coverage_tot[b], 1))
+    else:
+        out["active_bottleneck_f1"] = float("nan")
+        out["coverage"] = float("nan")
+        for name in BOTTLE_NECKS:
+            out[f"coverage_{name}"] = float("nan")
+    return out

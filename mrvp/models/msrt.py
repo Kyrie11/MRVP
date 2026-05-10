@@ -7,7 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from mrvp.data.schema import ACTION_DIM, DEG_DIM, MECH_DIM, NUM_ACTIONS, STATE_DIM, MECH_SLICES
-from .common import make_mlp, mixture_diag_gaussian_nll
+from .common import grad_reverse, make_mlp, mixture_diag_gaussian_nll
 from .context import SceneContextEncoder
 
 
@@ -51,6 +51,12 @@ class MSRT(nn.Module):
         self.mix_log_scale = make_mlp(hidden_dim + mech_dim + deg_dim, [hidden_dim], mixture_count * state_dim, dropout=dropout, layer_norm=False)
         self.side_head = make_mlp(hidden_dim, [128], 5, dropout=dropout, layer_norm=False)
         self.contact_head = make_mlp(hidden_dim, [128], 1, dropout=dropout, layer_norm=False)
+        # Optional adversarial diagnostic/regularizer: if lambda_suf > 0,
+        # z_mech is trained through a gradient-reversal action classifier so
+        # raw action identity leakage is discouraged without changing the
+        # default training path. Keep lambda_suf small and verify with
+        # diagnose_residual_action.py.
+        self.action_adversary = make_mlp(mech_dim, [128], num_actions, dropout=dropout, layer_norm=True)
 
     def encode(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         ctx = self.context_encoder(batch["o_hist"], batch["h_ctx"])
@@ -158,15 +164,23 @@ class MSRT(nn.Module):
         reset_prior = self.physics_reset_prior(batch, out["z_mech"])
         reset_target = batch["z_mech"][:, MECH_SLICES["reset"]]
         phys_loss = F.smooth_l1_loss(reset_pred - reset_prior, reset_target - reset_prior.detach())
-        # Sufficiency regularizer proxy: make z reconstruction accurate but not overly action-id dominated
-        # by penalizing z variance explained by action embedding norm. The diagnostic script is the real test.
-        z_by_action_penalty = out["z_mech"].pow(2).mean() * 0.0
+        # Optional action-adversarial regularizer. The classifier learns to
+        # predict action_id from z; gradient reversal makes z less useful for
+        # raw action identity. This is a weak regularizer, not a substitute for
+        # the residual-action diagnostic.
+        suf_weight = float(lambdas.get("suf", 0.0))
+        if suf_weight > 0.0:
+            adv_logits = self.action_adversary(grad_reverse(out["z_mech"], scale=1.0))
+            action_adv_loss = F.cross_entropy(adv_logits, batch["action_id"].long().clamp_min(0) % self.num_actions)
+        else:
+            adv_logits = self.action_adversary(out["z_mech"].detach())
+            action_adv_loss = F.cross_entropy(adv_logits, batch["action_id"].long().clamp_min(0) % self.num_actions).detach()
         total = (
             nll
             + lambdas.get("deg", 1.0) * deg_loss
             + lambdas.get("mech", 1.0) * (mech_loss + 0.5 * contact_loss + 0.5 * side_loss)
             + lambdas.get("phys", 0.2) * phys_loss
-            + lambdas.get("suf", 0.0) * z_by_action_penalty
+            + suf_weight * action_adv_loss
         )
         return {
             "loss": total,
@@ -176,4 +190,5 @@ class MSRT(nn.Module):
             "contact_loss": contact_loss.detach(),
             "side_loss": side_loss.detach(),
             "phys_loss": phys_loss.detach(),
+            "action_adv_loss": action_adv_loss.detach(),
         }

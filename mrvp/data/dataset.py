@@ -126,6 +126,26 @@ def mrvp_collate(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def iter_root_batches(dataset: MRVPDataset, shuffle: bool = False, seed: int = 0):
+    """Yield root-level batches without leaking counterfactual actions across roots.
+
+    Each yield is ``(root_id, indices, rows, batch)`` where ``indices`` are
+    dataset-local row indices, ``rows`` are the normalized row dictionaries and
+    ``batch`` is the standard tensor batch produced by ``mrvp_collate``. This
+    loader is intended for claim-level evaluation and action selection because
+    all candidate actions from the same root must be scored together.
+    """
+    root_ids = list(dataset.root_to_indices.keys())
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(root_ids)
+    for root_id in root_ids:
+        indices = list(dataset.root_to_indices[root_id])
+        rows = [dataset.rows[i] for i in indices]
+        batch = mrvp_collate([dataset[i] for i in indices])
+        yield root_id, indices, rows, batch
+
+
 def rows_by_root(dataset: MRVPDataset) -> Dict[str, List[Dict[str, Any]]]:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row in dataset.rows:

@@ -34,8 +34,8 @@ def train_msrt(args, device: torch.device) -> Path:
     best = float("inf")
     out_path = Path(args.out_dir) / "msrt.pt"
     for epoch in range(1, args.epochs + 1):
-        tr = train_one_epoch(model, train_loader, opt, device, loss_kwargs={"lambdas": {"mech": args.lambda_mech, "phys": args.lambda_phys, "deg": 1.0}}, desc=f"msrt train {epoch}")
-        va = eval_loss(model, val_loader, device, loss_kwargs={"lambdas": {"mech": args.lambda_mech, "phys": args.lambda_phys, "deg": 1.0}}, desc=f"msrt val {epoch}")
+        tr = train_one_epoch(model, train_loader, opt, device, loss_kwargs={"lambdas": {"mech": args.lambda_mech, "phys": args.lambda_phys, "deg": 1.0, "suf": args.lambda_suf}}, desc=f"msrt train {epoch}")
+        va = eval_loss(model, val_loader, device, loss_kwargs={"lambdas": {"mech": args.lambda_mech, "phys": args.lambda_phys, "deg": 1.0, "suf": args.lambda_suf}}, desc=f"msrt val {epoch}")
         print(json.dumps({"stage": "msrt", "epoch": epoch, "train": tr, "val": va}, ensure_ascii=False))
         if va.get("loss", tr["loss"]) < best:
             best = va.get("loss", tr["loss"])
@@ -116,6 +116,7 @@ def main() -> None:
     parser.add_argument("--mixture-count", type=int, default=5)
     parser.add_argument("--lambda-mech", type=float, default=1.0)
     parser.add_argument("--lambda-phys", type=float, default=0.2)
+    parser.add_argument("--lambda-suf", type=float, default=0.0, help="Optional gradient-reversal action adversary on z_mech; keep small and verify with diagnose_residual_action.py.")
     parser.add_argument("--lambda-act", type=float, default=0.5)
     parser.add_argument("--lambda-bd", type=float, default=2.0)
     parser.add_argument("--sigma-bd", type=float, default=0.5)

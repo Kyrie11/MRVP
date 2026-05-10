@@ -14,6 +14,12 @@ from mrvp.training.checkpoints import save_checkpoint
 from mrvp.training.loops import eval_loss, train_one_epoch
 
 
+def auto_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train MRVP experiment baseline networks.")
     parser.add_argument("--data", required=True)
@@ -23,7 +29,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1)
     args = parser.parse_args()
     torch.set_num_threads(max(1, args.torch_threads))
@@ -35,7 +41,7 @@ def main() -> None:
         model = UnstructuredLatentRiskNetwork(hidden_dim=args.hidden_dim)
     else:
         model = DirectActionRiskNetwork(hidden_dim=args.hidden_dim, scalar=args.baseline == "scalar_recoverability")
-    device = torch.device(args.device)
+    device = auto_device(args.device)
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     out_path = Path(args.out_dir) / f"{args.baseline}.pt"

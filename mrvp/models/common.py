@@ -1,10 +1,31 @@
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+
+class _GradientReverseFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = float(scale)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return -ctx.scale * grad_output, None
+
+
+def grad_reverse(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Gradient reversal layer used by optional adversarial diagnostics.
+
+    Forward is the identity. During backpropagation the gradient wrt ``x`` is
+    multiplied by ``-scale`` so a downstream classifier is trained to predict a
+    nuisance variable while the upstream representation is trained to hide it.
+    """
+    return _GradientReverseFn.apply(x, float(scale))
 
 
 def make_mlp(in_dim: int, hidden: Sequence[int], out_dim: int, dropout: float = 0.0, layer_norm: bool = False) -> nn.Sequential:

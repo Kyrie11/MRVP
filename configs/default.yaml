@@ -2,6 +2,8 @@
 scenario_generation:
   number_of_root_scenarios: 1000
   actions_per_root: 8
+  metadrive_backend: auto   # auto -> MetaDrive if installed, else light2d fallback
+  shift_test: true          # harder friction/density/damage for held-out roots
   action_library:
     - hard_brake
     - brake_left
@@ -38,7 +40,7 @@ msrt:
   hidden_dim: 256
   lambda_mech: 1.0
   lambda_phys: 0.2
-  lambda_suf: 0.0
+  lambda_suf: 0.0   # optional gradient-reversal action adversary on z_mech
   lambda_inv: 0.0
 rpn:
   hidden_dim: 256

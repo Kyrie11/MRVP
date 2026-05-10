@@ -11,3 +11,4 @@ PyYAML>=6.0
 # nuscenes-devkit          # nuScenes
 # commonroad-io            # CommonRoad XML
 # carla                    # Prefer the CARLA egg matching your simulator version
+# metadrive-simulator       # Optional: generate MetaDrive MRVP counterfactual rollouts

@@ -15,6 +15,12 @@ from mrvp.training.checkpoints import save_checkpoint
 from mrvp.training.loops import to_device
 
 
+def auto_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pretrain MRVP scene/context encoder on public driving data.")
     parser.add_argument("--data", required=True)
@@ -22,7 +28,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1)
     args = parser.parse_args()
     torch.set_num_threads(max(1, args.torch_threads))
@@ -34,7 +40,7 @@ def main() -> None:
         train_ds, val_ds = ds, None
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=pretrain_collate)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=pretrain_collate) if val_ds else None
-    device = torch.device(args.device)
+    device = auto_device(args.device)
     encoder = SceneContextEncoder(out_dim=128)
     model = ContextPretrainingHead(encoder).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
