@@ -118,7 +118,7 @@ def baseline_scores(rows: Sequence[Mapping[str, Any]], kind: str = "severity") -
             score += 0.4 * z[19]  # road clearance
             score += 0.3 * z[21]  # secondary clearance
             score += 0.1 * z[20]  # return corridor length
-            score -= 0.2 * abs(x[6])
+            score -= 0.2 * abs(x[5])
             score -= 0.2 * float(r["rho_imp"])
             scores.append(score)
         return np.asarray(scores, dtype=np.float32)

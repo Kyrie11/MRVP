@@ -468,12 +468,6 @@ def _rollout_metadrive(scene: RootScene, action_vec: np.ndarray, dt: float = 0.0
         "num_scenarios": 1,
         "log_level": 50,
         "image_observation": False,
-
-        "crash_vehicle_done": False,
-        "crash_object_done": False,
-        "crash_human_done": False,
-        "out_of_road_done": False,
-
         "vehicle_config": {"show_navi_mark": False},
     }
     env = MetaDriveEnv(config)
@@ -626,25 +620,102 @@ def _margins_from_rollout(scene: RootScene, result: RolloutResult) -> np.ndarray
     )
 
 
+
+def _paper_state_from_internal(state: np.ndarray, accel: Tuple[float, float] = (0.0, 0.0), control: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> np.ndarray:
+    """Convert the light2d internal state to the paper state layout.
+
+    Internal rollout states keep speed/time for convenience:
+    [x,y,yaw,vx,vy,speed,yaw_rate,beta,steer,t,...].  The exported schema uses
+    [p_x,p_y,psi,v_x,v_y,yaw_rate,a_x,a_y,beta,delta,F_b,F_x].
+    """
+    out = np.zeros(STATE_DIM, dtype=np.float32)
+    out[0] = float(state[0])
+    out[1] = float(state[1])
+    out[2] = float(state[2])
+    out[3] = float(state[3])
+    out[4] = float(state[4])
+    out[5] = float(state[6]) if state.shape[0] > 6 else 0.0
+    out[6] = float(accel[0])
+    out[7] = float(accel[1])
+    out[8] = float(state[7]) if state.shape[0] > 7 else 0.0
+    out[9] = float(state[8]) if state.shape[0] > 8 else float(control[0])
+    # Paper control order is (delta, F_b, F_x).  Rollout controls are
+    # (steer, throttle, brake), so export brake then throttle.
+    out[10] = float(control[2])
+    out[11] = float(control[1])
+    return out
+
+
+def _paper_traj_from_internal(traj: Sequence[np.ndarray], controls: Sequence[Tuple[float, float, float]]) -> List[List[float]]:
+    out: List[List[float]] = []
+    prev = None
+    prev_t = None
+    for i, state in enumerate(traj):
+        control = controls[min(i, len(controls) - 1)] if controls else (0.0, 0.0, 0.0)
+        if prev is not None:
+            dt = max(1e-3, float(state[9] - prev_t)) if state.shape[0] > 9 and prev_t is not None else 0.1
+            ax = (float(state[3]) - float(prev[3])) / dt
+            ay = (float(state[4]) - float(prev[4])) / dt
+        else:
+            ax = ay = 0.0
+        out.append(_paper_state_from_internal(state, accel=(ax, ay), control=control).astype(float).tolist())
+        prev = state
+        prev_t = float(state[9]) if state.shape[0] > 9 else None
+    return out
+
+
+def _world_plus_from_rollout(scene: RootScene, result: RolloutResult, r_star: np.ndarray) -> Dict[str, Any]:
+    """Compact local recovery-world labels.
+
+    This is not a raster BEV; it is a deterministic compact vector/dict that the
+    dataset loader can flatten.  The field names match the future CARLA/BEV
+    adapter and keep the same model interface.
+    """
+    traj = result.recovery_traj if result.recovery_traj else [result.x_plus]
+    road = [_road_clearance(scene, s) for s in traj]
+    sec = [_min_actor_clearance(scene, s)[0] for s in traj]
+    xs = [float(s[0]) for s in traj]
+    ys = [float(s[1]) for s in traj]
+    return {
+        "drivable_crop": [float(np.mean(road)), float(np.min(road)), float(scene.road_half_width * 2.0), float(scene.lane_width)],
+        "future_occupancy": [float(scene.actor_density), float(np.min(sec)), float(np.mean(sec)), float(len(scene.actors))],
+        "actor_flow": [float(np.mean([a.vx for a in scene.actors]) if scene.actors else 0.0), float(np.mean([a.vy for a in scene.actors]) if scene.actors else 0.0)],
+        "reachable_mask": [float(max(0.0, scene.route_dx - abs(result.x_plus[1]))), float(np.ptp(xs) if len(xs) > 1 else 0.0), float(np.ptp(ys) if len(ys) > 1 else 0.0)],
+        "goal_mask": [float(scene.route_dx), float(scene.route_dy), float(r_star[-1])],
+    }
+
+
+def _event_type_from_rollout(scene: RootScene, result: RolloutResult, r_star: np.ndarray) -> str:
+    if result.collision:
+        return "contact"
+    if result.offroad or result.min_road_clearance < 0.15:
+        return "boundary"
+    if float(r_star[2]) < min(float(r_star[3]), 0.05):
+        return "stability"
+    if float(r_star[3]) < 0.05:
+        return "control"
+    return "none"
+
 def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, harm_thresholds: Sequence[float]) -> Dict[str, Any]:
     action_vec = ACTION_VECTORS[action_id % len(ACTION_VECTORS)].astype(np.float32)
     steering_scale = max(0.20, 1.0 - 0.12 * scene.damage_class)
     brake_scale = max(0.25, 1.0 - 0.10 * scene.damage_class)
     throttle_scale = max(0.30, 1.0 - 0.07 * scene.damage_class)
     delay = 0.02 + 0.035 * scene.damage_class
-    d_deg = np.asarray([steering_scale, brake_scale, throttle_scale, delay, scene.friction, scene.damage_class / 4.0], dtype=np.float32)
-    z = np.zeros(MECH_DIM, dtype=np.float32)
-    z[0] = 1.0 if result.collision else 0.0
+    deg = np.asarray([steering_scale, brake_scale, throttle_scale, delay, scene.friction, scene.damage_class / 4.0], dtype=np.float32)
+
+    audit = np.zeros(MECH_DIM, dtype=np.float32)
+    audit[0] = 1.0 if result.collision else 0.0
     side_id = SIDE_NAMES.index(result.collision_side) if result.collision_side in SIDE_NAMES else SIDE_NAMES.index("oblique")
-    z[1 + side_id] = 1.0
+    audit[1 + side_id] = 1.0
     normal = result.normal_xy.astype(np.float32)
     if np.linalg.norm(normal) < 1e-6:
         normal = np.asarray([1.0, 0.0], dtype=np.float32)
     normal = normal / (np.linalg.norm(normal) + 1e-6)
-    z[6:8] = normal
-    z[8] = float(result.overlap_clearance)
-    z[9] = _wrap_angle(float(result.x_plus[2] - result.x_minus[2]))
-    z[10] = float(result.rho_imp)
+    audit[6:8] = normal
+    audit[8] = float(result.overlap_clearance)
+    audit[9] = _wrap_angle(float(result.x_plus[2] - result.x_minus[2]))
+    audit[10] = float(result.rho_imp)
     reset = np.asarray(
         [
             result.x_plus[3] - result.x_minus[3],
@@ -657,16 +728,26 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
         ],
         dtype=np.float32,
     )
-    z[11:18] = reset
+    audit[11:18] = reset
     road_clear = _road_clearance(scene, result.x_plus)
     sec_clear, _ = _min_actor_clearance(scene, result.x_plus)
     return_corridor = max(0.0, scene.route_dx - max(0.0, abs(float(result.x_plus[1])) - 0.25 * scene.lane_width) * 3.0 - 3.0 * scene.actor_density)
-    z[18:24] = [scene.lane_width, road_clear, return_corridor, sec_clear, np.sign(scene.route_dy), 1.0]
-    z[24:29] = [steering_scale, brake_scale, delay, scene.friction, scene.damage_class / 4.0]
-    z[29:32] = [0.04 + 0.10 * scene.actor_density, 0.05 + 0.18 * float(result.collision), scene.actor_density]
-    r_star = _margins_from_rollout(scene, result)
+    audit[18:24] = [scene.lane_width, road_clear, return_corridor, sec_clear, np.sign(scene.route_dy), 1.0]
+    audit[24:29] = [steering_scale, brake_scale, delay, scene.friction, scene.damage_class / 4.0]
+    audit[29:32] = [0.04 + 0.10 * scene.actor_density, 0.05 + 0.18 * float(result.collision), scene.actor_density]
+
+    m_star = _margins_from_rollout(scene, result)
     rho_imp = float(result.rho_imp)
     harm_bin = harm_bin_from_rho(rho_imp, harm_thresholds)
+    event_type = _event_type_from_rollout(scene, result, m_star)
+    event_time = float(result.x_plus[9]) if result.x_plus.shape[0] > 9 else float(action_vec[3])
+    x_t_internal = _state_vec(scene.base_x, scene.base_y, scene.base_yaw, scene.base_speed, 0.0, 0.0, 0.0, 0.0)
+    # Convert rollout controls from (steer, throttle, brake) to paper order
+    # (delta, F_b, F_x).
+    teacher_u = [[float(c[0]), float(c[2]), float(c[1])] for c in result.recovery_controls]
+    teacher_traj = _paper_traj_from_internal(result.recovery_traj, result.recovery_controls)
+    world_plus = _world_plus_from_rollout(scene, result, m_star)
+    calib_event = event_type
     return {
         "root_id": scene.root_id,
         "split": scene.split,
@@ -677,17 +758,40 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
         "action_vec": action_vec.tolist(),
         "o_hist": _history_from_scene(scene).tolist(),
         "h_ctx": _context_from_scene(scene).tolist(),
+        "x_t": _paper_state_from_internal(x_t_internal).astype(float).tolist(),
         "rho_imp": rho_imp,
         "harm_bin": int(harm_bin),
-        "x_minus": result.x_minus.astype(float).tolist(),
-        "x_plus": result.x_plus.astype(float).tolist(),
-        "d_deg": d_deg.tolist(),
-        "z_mech": z.tolist(),
-        "r_star": r_star.tolist(),
-        "b_star": int(np.argmin(r_star)),
-        "s_star": float(np.min(r_star)),
+        "event_type": event_type,
+        "event_time": event_time,
+        "x_minus": _paper_state_from_internal(result.x_minus).astype(float).tolist(),
+        "x_plus": _paper_state_from_internal(result.x_plus, control=(float(action_vec[0]), float(action_vec[1]), float(action_vec[2]))).astype(float).tolist(),
+        "deg": deg.tolist(),
+        "world_plus": world_plus,
+        "teacher_u": teacher_u,
+        "teacher_traj": teacher_traj,
+        "m_star": m_star.tolist(),
+        "b_star": int(np.argmin(m_star)),
+        "s_star": float(np.min(m_star)),
+        "audit_mech": {
+            "event_type": event_type,
+            "contact_side": result.collision_side,
+            "boundary_side": "right" if scene.boundary_side > 0 else "left",
+            "normal_xy": normal.astype(float).tolist(),
+            "overlap_clearance": float(result.overlap_clearance),
+            "relative_heading": float(audit[9]),
+            "relative_speed": float(result.rho_imp),
+            "reset": reset.astype(float).tolist(),
+            "affordance": audit[18:24].astype(float).tolist(),
+            "degradation": audit[24:29].astype(float).tolist(),
+            "uncertainty": audit[29:32].astype(float).tolist(),
+        },
+        # Backward-compatible aliases for older analysis scripts.
+        "d_deg": deg.tolist(),
+        "z_mech": audit.tolist(),
+        "r_star": m_star.tolist(),
         "calib_group": {
-            "contact_type": "contact" if result.collision else ("boundary" if result.offroad else "non_contact"),
+            "event_type": calib_event,
+            "contact_type": calib_event,
             "contact_side": result.collision_side,
             "boundary_side": "right" if scene.boundary_side > 0 else "left",
             "friction_bin": "low" if scene.friction < 0.55 else ("mid" if scene.friction < 0.85 else "high"),
@@ -698,7 +802,6 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
             "done_reason": result.done_reason,
         },
     }
-
 
 def make_metadrive_rows(
     n_roots: int = 240,

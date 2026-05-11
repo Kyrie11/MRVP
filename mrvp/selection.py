@@ -17,7 +17,7 @@ def admissible_indices(rows: Sequence[Mapping[str, Any]]) -> List[int]:
     return [i for i, r in enumerate(rows) if int(r["harm_bin"]) == min_bin]
 
 
-def select_from_scores(rows: Sequence[Mapping[str, Any]], lower_bounds: np.ndarray, beta: float = 0.9) -> Dict[str, Any]:
+def select_from_scores(rows: Sequence[Mapping[str, Any]], lower_bounds: np.ndarray, beta: float = 0.2) -> Dict[str, Any]:
     """Offline selector using one lower-bound profile per action."""
     adm = admissible_indices(rows)
     if not adm:
@@ -45,7 +45,7 @@ def select_action_with_models(
     rpn: torch.nn.Module,
     calibration_table: Mapping[str, Any],
     num_samples: int = 32,
-    beta: float = 0.9,
+    beta: float = 0.2,
     device: str | torch.device = "cpu",
 ) -> Dict[str, Any]:
     """Algorithm 1: harm gate -> MSRT samples -> RPN -> group calibration -> CVaR."""
@@ -72,7 +72,10 @@ def select_action_with_models(
             "o_hist": single["o_hist"].repeat_interleave(num_samples, dim=0),
             "h_ctx": single["h_ctx"].repeat_interleave(num_samples, dim=0),
             "x_plus": samples["x_plus"],
+            "deg": samples["deg"],
             "d_deg": samples["d_deg"],
+            "event_tokens": samples["event_tokens"],
+            "world_plus": samples["world_plus"],
             "z_mech": samples["z_mech"],
         }
         pred = rpn(rep)["r_hat"]

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+
 import argparse
 import json
 from pathlib import Path
@@ -14,7 +18,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from mrvp.data.dataset import MRVPDataset, mrvp_collate
-from mrvp.data.schema import NUM_ACTIONS
+from mrvp.data.schema import NUM_ACTIONS, TOKEN_COUNT, TOKEN_DIM, SchemaDims
 from mrvp.models.common import make_mlp
 from mrvp.models.msrt import MSRT
 from mrvp.training.checkpoints import load_model
@@ -96,8 +100,11 @@ def build_features(
     msrt: MSRT | None,
     device: torch.device,
     batch_size: int,
+    token_count: int = TOKEN_COUNT,
+    token_dim: int = TOKEN_DIM,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    ds = MRVPDataset(data_path, split=split)
+    dims = SchemaDims(token_count=token_count, token_dim=token_dim)
+    ds = MRVPDataset(data_path, split=split, dims=dims)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=mrvp_collate)
     x0_parts = []
     x1_parts = []
@@ -111,16 +118,18 @@ def build_features(
             pred = msrt.sample(mb, num_samples=1, deterministic=True)
             x_plus = pred["x_plus"].detach().cpu()
             d_deg = pred["d_deg"].detach().cpu()
-            z_mech = pred["z_mech"].detach().cpu()
+            event_tokens = pred["event_tokens"].detach().cpu()
+            world_plus = pred["world_plus"].detach().cpu()
         else:
             x_plus = batch["x_plus"].float()
             d_deg = batch["d_deg"].float()
-            z_mech = batch["z_mech"].float()
+            event_tokens = batch["event_tokens"].float()
+            world_plus = batch["world_plus"].float()
         h_ctx = batch["h_ctx"].float()
         aid = batch["action_id"].long().clamp_min(0) % NUM_ACTIONS
         action_onehot = F.one_hot(aid, NUM_ACTIONS).float()
         action_feat = torch.cat([batch["action_vec"].float(), action_onehot], dim=-1)
-        x0 = torch.cat([x_plus, d_deg, z_mech, h_ctx], dim=-1)
+        x0 = torch.cat([x_plus, d_deg, event_tokens.flatten(1), world_plus, h_ctx], dim=-1)
         x1 = torch.cat([x0, action_feat], dim=-1)
         x0_parts.append(x0.numpy())
         x1_parts.append(x1.numpy())
@@ -237,8 +246,8 @@ def train_probe(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Residual-action sufficiency diagnostic. Probe0 sees (x_plus,d_deg,z_mech,h_ctx); "
-            "Probe1 additionally sees action_vec and action_id one-hot. A small Probe1-Probe0 gain supports mechanism sufficiency."
+            "Residual-action sufficiency diagnostic. Probe0 sees (x_plus,deg,event_tokens,world_plus,h_ctx); "
+            "Probe1 additionally sees action_vec and action_id one-hot. A small Probe1-Probe0 gain supports event-token/world sufficiency."
         )
     )
     parser.add_argument("--data", required=True)
@@ -255,6 +264,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--msrt-hidden-dim", type=int, default=256)
     parser.add_argument("--mixture-count", type=int, default=5)
+    parser.add_argument("--token-count", type=int, default=TOKEN_COUNT)
+    parser.add_argument("--token-dim", type=int, default=TOKEN_DIM)
     args = parser.parse_args()
 
     torch.set_num_threads(max(1, args.torch_threads))
@@ -263,13 +274,13 @@ def main() -> None:
     if args.feature_source == "predicted_msrt":
         if not args.msrt:
             raise SystemExit("--feature-source predicted_msrt requires --msrt")
-        msrt = MSRT(hidden_dim=args.msrt_hidden_dim, mixture_count=args.mixture_count).to(device)
+        msrt = MSRT(hidden_dim=args.msrt_hidden_dim, mixture_count=args.mixture_count, token_count=args.token_count, token_dim=args.token_dim).to(device)
         load_model(msrt, args.msrt, device, strict=False)
         msrt.eval()
 
-    x0_train, x1_train, y_rec_train, y_b_train = build_features(args.data, "train", args.feature_source, msrt, device, args.batch_size)
-    x0_val, x1_val, y_rec_val, y_b_val = build_features(args.data, "val", args.feature_source, msrt, device, args.batch_size)
-    x0_test, x1_test, y_rec_test, y_b_test = build_features(args.data, "test", args.feature_source, msrt, device, args.batch_size)
+    x0_train, x1_train, y_rec_train, y_b_train = build_features(args.data, "train", args.feature_source, msrt, device, args.batch_size, args.token_count, args.token_dim)
+    x0_val, x1_val, y_rec_val, y_b_val = build_features(args.data, "val", args.feature_source, msrt, device, args.batch_size, args.token_count, args.token_dim)
+    x0_test, x1_test, y_rec_test, y_b_test = build_features(args.data, "test", args.feature_source, msrt, device, args.batch_size, args.token_count, args.token_dim)
 
     y_train, y_val, y_test = (y_rec_train, y_rec_val, y_rec_test) if args.target == "recoverable" else (y_b_train, y_b_val, y_b_test)
     x0_train_s, x0_val_s, x0_test_s, stats0 = standardize(x0_train, x0_val, x0_test)
@@ -292,8 +303,8 @@ def main() -> None:
         "feature_source": args.feature_source,
         "target": args.target,
         "interpretation": {
-            "probe0_input": "x_plus,d_deg,z_mech,h_ctx",
-            "probe1_input": "x_plus,d_deg,z_mech,h_ctx,action_vec,action_id_onehot",
+            "probe0_input": "x_plus,deg,event_tokens,world_plus,h_ctx",
+            "probe1_input": "x_plus,deg,event_tokens,world_plus,h_ctx,action_vec,action_id_onehot",
             "rule_of_thumb": "Small or negative Probe1-Probe0 gain supports mechanism sufficiency; a large positive gain indicates residual action shortcut/leakage.",
         },
         "probe0_no_action": {"val": probe0["val"], "test": probe0["test"]},

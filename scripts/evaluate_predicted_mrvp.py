@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+
 import argparse
 import csv
 import json
@@ -13,7 +17,7 @@ from tqdm import tqdm
 
 from mrvp.calibration import load_calibration_table, lower_bounds_for_rows, predict_rpn, quantile_for_group
 from mrvp.data.dataset import MRVPDataset, iter_root_batches
-from mrvp.data.schema import BOTTLE_NECKS
+from mrvp.data.schema import BOTTLE_NECKS, TOKEN_COUNT, TOKEN_DIM, STRATEGY_COUNT, RECOVERY_HORIZON, SchemaDims
 from mrvp.evaluation import (
     baseline_scores,
     evaluate_selected_indices,
@@ -75,7 +79,10 @@ def score_root_with_msrt(
             "o_hist": single["o_hist"].repeat_interleave(num_samples, dim=0),
             "h_ctx": single["h_ctx"].repeat_interleave(num_samples, dim=0),
             "x_plus": samples["x_plus"],
+            "deg": samples["deg"],
             "d_deg": samples["d_deg"],
+            "event_tokens": samples["event_tokens"],
+            "world_plus": samples["world_plus"],
             "z_mech": samples["z_mech"],
         }
         pred = rpn(rep)["r_hat"]
@@ -137,10 +144,14 @@ def main() -> None:
     parser.add_argument("--split", default="test")
     parser.add_argument("--output", default="runs/default/eval_predicted_mrvp.json")
     parser.add_argument("--num-samples", type=int, default=32)
-    parser.add_argument("--beta", type=float, default=0.9)
+    parser.add_argument("--beta", type=float, default=0.2)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--mixture-count", type=int, default=5)
+    parser.add_argument("--token-count", type=int, default=TOKEN_COUNT)
+    parser.add_argument("--token-dim", type=int, default=TOKEN_DIM)
+    parser.add_argument("--strategy-count", type=int, default=STRATEGY_COUNT)
+    parser.add_argument("--recovery-horizon", type=int, default=RECOVERY_HORIZON)
     parser.add_argument("--scalar-rpn", action="store_true")
     parser.add_argument("--direct-model", default="", help="Optional trained direct_action_to_risk checkpoint.")
     parser.add_argument("--direct-calibration", default="", help="Optional calibration table for the direct baseline.")
@@ -151,12 +162,13 @@ def main() -> None:
 
     torch.set_num_threads(max(1, args.torch_threads))
     device = auto_device(args.device)
-    ds = MRVPDataset(args.data, split=args.split)
+    dims = SchemaDims(token_count=args.token_count, token_dim=args.token_dim, recovery_horizon=args.recovery_horizon)
+    ds = MRVPDataset(args.data, split=args.split, dims=dims)
 
-    msrt = MSRT(hidden_dim=args.hidden_dim, mixture_count=args.mixture_count).to(device)
+    msrt = MSRT(hidden_dim=args.hidden_dim, mixture_count=args.mixture_count, token_count=args.token_count, token_dim=args.token_dim).to(device)
     load_model(msrt, args.msrt, device, strict=False)
     msrt.eval()
-    rpn = RecoveryProfileNetwork(hidden_dim=args.hidden_dim, scalar=args.scalar_rpn).to(device)
+    rpn = RecoveryProfileNetwork(hidden_dim=args.hidden_dim, token_count=args.token_count, token_dim=args.token_dim, strategy_count=args.strategy_count, recovery_horizon=args.recovery_horizon, scalar=args.scalar_rpn).to(device)
     load_model(rpn, args.rpn, device, strict=False)
     rpn.eval()
     table = load_calibration_table(args.calibration or None)

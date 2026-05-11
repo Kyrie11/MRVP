@@ -1,9 +1,10 @@
-# MRVP default hyperparameters matching the paper appendix checklist.
+# MRVP default hyperparameters for the revised event-token / strategy-branch code path.
 scenario_generation:
   number_of_root_scenarios: 1000
   actions_per_root: 8
-  metadrive_backend: auto   # auto -> MetaDrive if installed, else light2d fallback
-  shift_test: true          # harder friction/density/damage for held-out roots
+  backend: auto              # auto -> MetaDrive if installed, else light2d fallback
+  shift_test: true           # harder friction/density/damage for held-out roots
+  action_duration_s: 1.0
   action_library:
     - hard_brake
     - brake_left
@@ -13,53 +14,74 @@ scenario_generation:
     - mild_right
     - boundary_side_steer
     - corridor_side_steer
+
+schema:
+  state_layout: [p_x, p_y, psi, v_x, v_y, yaw_rate, a_x, a_y, beta, delta, F_b, F_x]
+  control_layout: [delta, F_b, F_x]
+  event_types: [none, contact, boundary, stability, control]
+  preferred_fields: [root_id, action_id, o_hist, h_ctx, x_t, rho_imp, harm_bin, event_type, event_time, x_minus, x_plus, deg, world_plus, teacher_u, teacher_traj, m_star, audit_mech]
+  legacy_aliases:
+    d_deg: deg
+    z_mech: audit_mech
+    r_star: m_star
+
 harm_gate:
   harm_surrogate: impulse_or_delta_v
   bin_thresholds: [0.5, 2.0, 4.0, 7.0, 11.0]
-transition_extraction:
-  K: 4
-  epsilon_v: 0.8
-  epsilon_r: 0.4
-  delta_max: 0.8
-boundary_transition:
-  eps:
-    road: 0.25
-    stability: 0.15
-    control: 0.10
-    secondary: 1.0
-    return: 2.0
-  sigma:
-    road: 0.25
-    stability: 0.25
-    control: 0.20
-    secondary: 2.0
-    return: 4.0
-  delta: 0.2
+
 msrt:
+  module: ActionConditionedRecoveryEventTokenizer
   mixture_count: 5
   hidden_dim: 256
-  lambda_mech: 1.0
-  lambda_phys: 0.2
-  lambda_suf: 0.0   # optional gradient-reversal action adversary on z_mech
-  lambda_inv: 0.0
+  token_count: 16
+  token_dim: 32       # compact default; increase with hidden_dim for larger paper-scale runs
+  world_dim: 64
+  losses:
+    lambda_nll: 1.0
+    lambda_event: 1.0
+    lambda_token: 0.5
+    lambda_world: 0.5
+    lambda_deg: 1.0
+    lambda_probe: 0.1
+    lambda_ctr: 0.1
+    contrastive_temperature: 0.1
+    lambda_suf: 0.0   # optional action adversary for diagnostics only
+
 rpn:
+  module: PolicyConditionedRecoveryViabilityNetwork
   hidden_dim: 256
-  lambda_act: 0.5
-  lambda_bd: 2.0
-  sigma_bd: 0.5
-  lambda_mono: 0.0
+  strategy_count: 6
+  recovery_horizon: 30
+  losses:
+    lambda_act: 0.5
+    lambda_bd: 2.0
+    sigma_bd: 0.5
+    lambda_strat: 0.5
+    lambda_dyn: 0.05
+    lambda_ctrl: 0.05
+    lambda_xi: 0.25
+    lambda_mono: 0.0
+
 pair_mining:
   epsilon_s: 0.25
   margin: 0.05
+  lambda_ord: 1.0
+  max_pairs_per_root: 64
+
 calibration:
   delta_b: 0.02
   n_min: 20
+  hierarchy: [full, medium, coarse, global]
+
 selection:
-  transition_samples: 32
-  beta: 0.9
+  transition_samples: 16
+  beta: 0.2
+  admissible_set: min_harm_bin_within_root
+
 recovery_teacher:
-  horizon: 5.0
-  dt: 0.1
-closed_loop:
+  horizon_steps: 30
   control_frequency_hz: 20
-  mrvp_selection_frequency_hz: 10
+
+closed_loop_future_work:
+  primary_simulator: MetaDrive
+  planned_simulator: CARLA

@@ -22,7 +22,7 @@ def iter_jsonl(paths: str | Path | Sequence[str | Path]) -> Iterable[Dict[str, A
         files = [Path(x) for x in paths]
     for file in files:
         if file.suffix == ".json":
-            obj = json.loads(file.read_text())
+            obj = json.loads(file.read_text(encoding="utf-8"))
             if isinstance(obj, list):
                 for row in obj:
                     yield row
@@ -40,7 +40,12 @@ def iter_jsonl(paths: str | Path | Sequence[str | Path]) -> Iterable[Dict[str, A
 
 
 class MRVPDataset(Dataset):
-    """PyTorch dataset for rows following the MRVP appendix schema."""
+    """PyTorch dataset for rows following the revised MRVP appendix schema.
+
+    Preferred rows contain ``event_tokens`` and ``world_plus``.  Older rows that
+    only contain ``z_mech``/``d_deg``/``r_star`` are normalized into the same
+    tensor interface so existing experiments remain runnable.
+    """
 
     def __init__(
         self,
@@ -52,8 +57,8 @@ class MRVPDataset(Dataset):
         self.path = path
         self.split = split
         self.dims = dims
-        rows = []
-        raw_rows = []
+        rows: List[Dict[str, Any]] = []
+        raw_rows: List[Dict[str, Any]] = []
         for row in iter_jsonl(path):
             if split is not None and str(row.get("split", "train")) != split:
                 continue
@@ -79,18 +84,28 @@ class MRVPDataset(Dataset):
             "action_vec": torch.as_tensor(row["action_vec"], dtype=torch.float32),
             "o_hist": torch.as_tensor(row["o_hist"], dtype=torch.float32),
             "h_ctx": torch.as_tensor(row["h_ctx"], dtype=torch.float32),
+            "x_t": torch.as_tensor(row["x_t"], dtype=torch.float32),
             "rho_imp": torch.tensor(row["rho_imp"], dtype=torch.float32),
             "harm_bin": torch.tensor(row["harm_bin"], dtype=torch.long),
+            "event_type_id": torch.tensor(row["event_type_id"], dtype=torch.long),
+            "event_time": torch.tensor(row["event_time"], dtype=torch.float32),
             "x_minus": torch.as_tensor(row["x_minus"], dtype=torch.float32),
             "x_plus": torch.as_tensor(row["x_plus"], dtype=torch.float32),
+            "deg": torch.as_tensor(row["deg"], dtype=torch.float32),
             "d_deg": torch.as_tensor(row["d_deg"], dtype=torch.float32),
+            "event_tokens": torch.as_tensor(row["event_tokens"], dtype=torch.float32),
+            "world_plus": torch.as_tensor(row["world_plus"], dtype=torch.float32),
             "z_mech": torch.as_tensor(row["z_mech"], dtype=torch.float32),
+            "teacher_u": torch.as_tensor(row["teacher_u"], dtype=torch.float32),
+            "teacher_traj": torch.as_tensor(row["teacher_traj"], dtype=torch.float32),
+            "m_star": torch.as_tensor(row["m_star"], dtype=torch.float32),
             "r_star": torch.as_tensor(row["r_star"], dtype=torch.float32),
             "b_star": torch.tensor(row["b_star"], dtype=torch.long),
             "s_star": torch.tensor(row["s_star"], dtype=torch.float32),
             "root_id": row["root_id"],
             "split": row["split"],
             "family": row["family"],
+            "event_type": row["event_type"],
             "calib_group": row["calib_group"],
         }
         return item
@@ -109,19 +124,28 @@ def mrvp_collate(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "action_vec",
         "o_hist",
         "h_ctx",
+        "x_t",
         "rho_imp",
         "harm_bin",
+        "event_type_id",
+        "event_time",
         "x_minus",
         "x_plus",
+        "deg",
         "d_deg",
+        "event_tokens",
+        "world_plus",
         "z_mech",
+        "teacher_u",
+        "teacher_traj",
+        "m_star",
         "r_star",
         "b_star",
         "s_star",
     ]
     for key in tensor_keys:
         out[key] = torch.stack([x[key] for x in batch], dim=0)
-    for key in ["root_id", "split", "family", "calib_group"]:
+    for key in ["root_id", "split", "family", "event_type", "calib_group"]:
         out[key] = [x[key] for x in batch]
     return out
 

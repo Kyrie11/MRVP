@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+
 import argparse
 import json
 from pathlib import Path
@@ -12,6 +16,7 @@ from tqdm import tqdm
 
 from mrvp.data.dataset import MRVPDataset, mrvp_collate
 from mrvp.data.pairs import SameRootPairDataset, pair_collate
+from mrvp.data.schema import RECOVERY_HORIZON, STRATEGY_COUNT, TOKEN_COUNT, TOKEN_DIM, SchemaDims
 from mrvp.models.msrt import MSRT
 from mrvp.models.rpn import RecoveryProfileNetwork, ordering_loss
 from mrvp.training.checkpoints import load_model, save_checkpoint
@@ -24,18 +29,75 @@ def auto_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+def build_msrt(args) -> MSRT:
+    return MSRT(
+        mixture_count=args.mixture_count,
+        hidden_dim=args.hidden_dim,
+        token_count=args.token_count,
+        token_dim=args.token_dim,
+    )
+
+
+def build_rpn(args) -> RecoveryProfileNetwork:
+    return RecoveryProfileNetwork(
+        hidden_dim=args.hidden_dim,
+        token_count=args.token_count,
+        token_dim=args.token_dim,
+        strategy_count=args.strategy_count,
+        recovery_horizon=args.recovery_horizon,
+        scalar=args.scalar_rpn,
+    )
+
+
+def msrt_lambdas(args) -> Dict[str, float]:
+    return {
+        "nll": args.lambda_nll,
+        "event": args.lambda_event,
+        "token": args.lambda_token,
+        "world": args.lambda_world,
+        "deg": args.lambda_deg,
+        "probe": args.lambda_probe,
+        "ctr": args.lambda_ctr,
+        "suf": args.lambda_suf,
+        "temperature": args.contrastive_temperature,
+    }
+
+
+def rpn_lambdas(args) -> Dict[str, float]:
+    return {
+        "act": args.lambda_act,
+        "bd": args.lambda_bd,
+        "sigma_bd": args.sigma_bd,
+        "strat": args.lambda_strat,
+        "dyn": args.lambda_dyn,
+        "ctrl": args.lambda_ctrl,
+        "mono": args.lambda_mono,
+        "lambda_xi": args.lambda_xi,
+    }
+
+
+def dataset_dims(args) -> SchemaDims:
+    return SchemaDims(
+        token_count=args.token_count,
+        token_dim=args.token_dim,
+        recovery_horizon=args.recovery_horizon,
+    )
+
+
 def train_msrt(args, device: torch.device) -> Path:
-    train_ds = MRVPDataset(args.data, split="train")
-    val_ds = MRVPDataset(args.data, split="val")
+    dims = dataset_dims(args)
+    train_ds = MRVPDataset(args.data, split="train", dims=dims)
+    val_ds = MRVPDataset(args.data, split="val", dims=dims)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=mrvp_collate)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=mrvp_collate)
-    model = MSRT(mixture_count=args.mixture_count, hidden_dim=args.hidden_dim).to(device)
+    model = build_msrt(args).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best = float("inf")
     out_path = Path(args.out_dir) / "msrt.pt"
+    lambdas = msrt_lambdas(args)
     for epoch in range(1, args.epochs + 1):
-        tr = train_one_epoch(model, train_loader, opt, device, loss_kwargs={"lambdas": {"mech": args.lambda_mech, "phys": args.lambda_phys, "deg": 1.0, "suf": args.lambda_suf}}, desc=f"msrt train {epoch}")
-        va = eval_loss(model, val_loader, device, loss_kwargs={"lambdas": {"mech": args.lambda_mech, "phys": args.lambda_phys, "deg": 1.0, "suf": args.lambda_suf}}, desc=f"msrt val {epoch}")
+        tr = train_one_epoch(model, train_loader, opt, device, loss_kwargs={"lambdas": lambdas}, desc=f"msrt train {epoch}")
+        va = eval_loss(model, val_loader, device, loss_kwargs={"lambdas": lambdas}, desc=f"msrt val {epoch}")
         print(json.dumps({"stage": "msrt", "epoch": epoch, "train": tr, "val": va}, ensure_ascii=False))
         if va.get("loss", tr["loss"]) < best:
             best = va.get("loss", tr["loss"])
@@ -44,19 +106,21 @@ def train_msrt(args, device: torch.device) -> Path:
 
 
 def train_rpn(args, device: torch.device) -> Path:
-    train_ds = MRVPDataset(args.data, split="train")
-    val_ds = MRVPDataset(args.data, split="val")
+    dims = dataset_dims(args)
+    train_ds = MRVPDataset(args.data, split="train", dims=dims)
+    val_ds = MRVPDataset(args.data, split="val", dims=dims)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=mrvp_collate)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=mrvp_collate)
-    model = RecoveryProfileNetwork(hidden_dim=args.hidden_dim, scalar=args.scalar_rpn).to(device)
+    model = build_rpn(args).to(device)
     if args.rpn_init and Path(args.rpn_init).exists():
         load_model(model, args.rpn_init, device, strict=False)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best = float("inf")
     out_path = Path(args.out_dir) / ("rpn_scalar.pt" if args.scalar_rpn else "rpn.pt")
+    lambdas = rpn_lambdas(args)
     for epoch in range(1, args.epochs + 1):
-        tr = train_one_epoch(model, train_loader, opt, device, loss_kwargs={"lambdas": {"act": args.lambda_act, "bd": args.lambda_bd, "sigma_bd": args.sigma_bd, "mono": args.lambda_mono}, "enable_mono": args.lambda_mono > 0}, desc=f"rpn train {epoch}")
-        va = eval_loss(model, val_loader, device, loss_kwargs={"lambdas": {"act": args.lambda_act, "bd": args.lambda_bd, "sigma_bd": args.sigma_bd}, "enable_mono": False}, desc=f"rpn val {epoch}")
+        tr = train_one_epoch(model, train_loader, opt, device, loss_kwargs={"lambdas": lambdas, "enable_mono": args.lambda_mono > 0}, desc=f"rpn train {epoch}")
+        va = eval_loss(model, val_loader, device, loss_kwargs={"lambdas": lambdas, "enable_mono": False}, desc=f"rpn val {epoch}")
         print(json.dumps({"stage": "rpn", "epoch": epoch, "train": tr, "val": va}, ensure_ascii=False))
         if va.get("loss", tr["loss"]) < best:
             best = va.get("loss", tr["loss"])
@@ -65,14 +129,15 @@ def train_rpn(args, device: torch.device) -> Path:
 
 
 def finetune_pairs(args, device: torch.device) -> Path:
-    base = MRVPDataset(args.data, split="train")
+    base = MRVPDataset(args.data, split="train", dims=dataset_dims(args))
     pair_ds = SameRootPairDataset(base, eps_s=args.eps_s, max_pairs_per_root=args.max_pairs_per_root)
     loader = DataLoader(pair_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=pair_collate)
-    model = RecoveryProfileNetwork(hidden_dim=args.hidden_dim, scalar=args.scalar_rpn).to(device)
+    model = build_rpn(args).to(device)
     init = Path(args.rpn_init) if args.rpn_init else Path(args.out_dir) / ("rpn_scalar.pt" if args.scalar_rpn else "rpn.pt")
     if init.exists():
         load_model(model, init, device, strict=False)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.5, weight_decay=args.weight_decay)
+    lambdas = rpn_lambdas(args)
     for epoch in range(1, args.epochs + 1):
         model.train()
         totals: Dict[str, float] = {}
@@ -84,8 +149,8 @@ def finetune_pairs(args, device: torch.device) -> Path:
             oi = model(bi)
             oj = model(bj)
             l_ord = ordering_loss(oi["V_smooth"], oj["V_smooth"], bi["s_star"].float(), bj["s_star"].float(), margin=args.pair_margin)
-            li = model.loss(bi, lambdas={"act": args.lambda_act, "bd": args.lambda_bd, "sigma_bd": args.sigma_bd})["loss"]
-            lj = model.loss(bj, lambdas={"act": args.lambda_act, "bd": args.lambda_bd, "sigma_bd": args.sigma_bd})["loss"]
+            li = model.loss(bi, lambdas=lambdas)["loss"]
+            lj = model.loss(bj, lambdas=lambdas)["loss"]
             loss = 0.5 * (li + lj) + args.lambda_ord * l_ord
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -114,12 +179,33 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--mixture-count", type=int, default=5)
-    parser.add_argument("--lambda-mech", type=float, default=1.0)
-    parser.add_argument("--lambda-phys", type=float, default=0.2)
-    parser.add_argument("--lambda-suf", type=float, default=0.0, help="Optional gradient-reversal action adversary on z_mech; keep small and verify with diagnose_residual_action.py.")
+    parser.add_argument("--token-count", type=int, default=TOKEN_COUNT)
+    parser.add_argument("--token-dim", type=int, default=TOKEN_DIM)
+    parser.add_argument("--strategy-count", type=int, default=STRATEGY_COUNT)
+    parser.add_argument("--recovery-horizon", type=int, default=RECOVERY_HORIZON)
+
+    # MSRT losses. lambda-mech/lambda-phys are kept as legacy aliases but no
+    # longer drive the revised path directly.
+    parser.add_argument("--lambda-nll", type=float, default=1.0)
+    parser.add_argument("--lambda-event", type=float, default=1.0)
+    parser.add_argument("--lambda-token", type=float, default=0.5)
+    parser.add_argument("--lambda-world", type=float, default=0.5)
+    parser.add_argument("--lambda-deg", type=float, default=1.0)
+    parser.add_argument("--lambda-probe", type=float, default=0.1)
+    parser.add_argument("--lambda-ctr", type=float, default=0.1)
+    parser.add_argument("--contrastive-temperature", type=float, default=0.1)
+    parser.add_argument("--lambda-mech", type=float, default=1.0, help=argparse.SUPPRESS)
+    parser.add_argument("--lambda-phys", type=float, default=0.2, help=argparse.SUPPRESS)
+    parser.add_argument("--lambda-suf", type=float, default=0.0, help="Optional gradient-reversal action adversary on event-token pool; use only for diagnostics.")
+
+    # RPN losses.
     parser.add_argument("--lambda-act", type=float, default=0.5)
     parser.add_argument("--lambda-bd", type=float, default=2.0)
     parser.add_argument("--sigma-bd", type=float, default=0.5)
+    parser.add_argument("--lambda-strat", type=float, default=0.5)
+    parser.add_argument("--lambda-dyn", type=float, default=0.05)
+    parser.add_argument("--lambda-ctrl", type=float, default=0.05)
+    parser.add_argument("--lambda-xi", type=float, default=0.25)
     parser.add_argument("--lambda-mono", type=float, default=0.0)
     parser.add_argument("--lambda-ord", type=float, default=1.0)
     parser.add_argument("--eps-s", type=float, default=0.25)

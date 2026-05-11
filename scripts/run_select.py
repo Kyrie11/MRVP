@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+
 import argparse
 import json
 from collections import defaultdict
@@ -11,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from mrvp.calibration import load_calibration_table
 from mrvp.data.dataset import MRVPDataset, mrvp_collate
+from mrvp.data.schema import TOKEN_COUNT, TOKEN_DIM, STRATEGY_COUNT, RECOVERY_HORIZON, SchemaDims
 from mrvp.models.msrt import MSRT
 from mrvp.models.rpn import RecoveryProfileNetwork
 from mrvp.selection import select_action_with_models
@@ -32,24 +37,29 @@ def main() -> None:
     parser.add_argument("--rpn", required=True)
     parser.add_argument("--calibration", default="")
     parser.add_argument("--num-samples", type=int, default=32)
-    parser.add_argument("--beta", type=float, default=0.9)
+    parser.add_argument("--beta", type=float, default=0.2)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--mixture-count", type=int, default=5)
+    parser.add_argument("--token-count", type=int, default=TOKEN_COUNT)
+    parser.add_argument("--token-dim", type=int, default=TOKEN_DIM)
+    parser.add_argument("--strategy-count", type=int, default=STRATEGY_COUNT)
+    parser.add_argument("--recovery-horizon", type=int, default=RECOVERY_HORIZON)
     parser.add_argument("--scalar-rpn", action="store_true")
     parser.add_argument("--torch-threads", type=int, default=1)
     args = parser.parse_args()
     torch.set_num_threads(max(1, args.torch_threads))
     device = auto_device(args.device)
-    ds = MRVPDataset(args.data, split=args.split)
+    dims = SchemaDims(token_count=args.token_count, token_dim=args.token_dim, recovery_horizon=args.recovery_horizon)
+    ds = MRVPDataset(args.data, split=args.split, dims=dims)
     idxs = ds.root_to_indices.get(str(args.root_id))
     if not idxs:
         raise SystemExit(f"root_id {args.root_id!r} not found in data/split")
     root_items = [ds[i] for i in idxs]
     root_batch = mrvp_collate(root_items)
     root_rows = [ds.rows[i] for i in idxs]
-    msrt = MSRT(mixture_count=args.mixture_count, hidden_dim=args.hidden_dim)
-    rpn = RecoveryProfileNetwork(hidden_dim=args.hidden_dim, scalar=args.scalar_rpn)
+    msrt = MSRT(mixture_count=args.mixture_count, hidden_dim=args.hidden_dim, token_count=args.token_count, token_dim=args.token_dim)
+    rpn = RecoveryProfileNetwork(hidden_dim=args.hidden_dim, token_count=args.token_count, token_dim=args.token_dim, strategy_count=args.strategy_count, recovery_horizon=args.recovery_horizon, scalar=args.scalar_rpn)
     load_model(msrt, args.msrt, device, strict=False)
     load_model(rpn, args.rpn, device, strict=False)
     table = load_calibration_table(args.calibration or None)

@@ -20,6 +20,7 @@ from .schema import (
     NUM_ACTIONS,
     STATE_DIM,
     SIDE_NAMES,
+    RECOVERY_HORIZON,
     harm_bin_from_rho,
 )
 
@@ -93,34 +94,35 @@ def make_synthetic_rows(
                 harm_action = rng.uniform(0.0, 0.4)  # non-contact boundary-critical.
             rho_imp = float(max(0.0, harm_action))
             harm_bin = harm_bin_from_rho(rho_imp, harm_thresholds)
-            # State before and after transition.
+            # State before and after transition.  Layout follows the revised paper:
+            # [p_x,p_y,psi,v_x,v_y,yaw_rate,a_x,a_y,beta,delta,F_b,F_x].
             x_minus = np.zeros(STATE_DIM, dtype=np.float32)
-            x_minus[:10] = [
-                base_x,
-                base_y,
-                base_yaw,
-                base_speed * np.cos(base_yaw),
-                base_speed * np.sin(base_yaw),
-                base_speed,
-                rng.normal(0, 0.05),
-                rng.normal(0, 0.03),
-                steer,
-                0.0,
-            ]
+            vx0 = float(base_speed * np.cos(base_yaw))
+            vy0 = float(base_speed * np.sin(base_yaw))
+            yaw_rate0 = float(rng.normal(0, 0.05))
+            beta0 = float(rng.normal(0, 0.03))
+            x_minus[:] = [base_x, base_y, base_yaw, vx0, vy0, yaw_rate0, 0.0, 0.0, beta0, steer, brake, throttle]
             yaw_reset = (0.15 + 0.05 * family_id) * steer_effect + (0.08 * damage_class) * rng.normal()
             speed_drop = (2.0 * brake_effect + 0.25 * rho_imp + rng.normal(0, 0.25)) if contact else 1.0 * brake_effect
             lat_shift = 0.4 * steer_effect + rng.normal(0, 0.15)
             x_plus = x_minus.copy()
+            new_speed = max(0.15, base_speed - speed_drop)
+            new_yaw = float(base_yaw + yaw_reset)
+            beta_plus = float(beta0 + np.arctan2(steer_effect * 0.8, max(new_speed, 1e-3)))
+            vx1 = float(new_speed * np.cos(new_yaw + beta_plus))
+            vy1 = float(new_speed * np.sin(new_yaw + beta_plus))
             x_plus[0] += duration * base_speed * np.cos(base_yaw) * 0.65
             x_plus[1] += lat_shift
-            x_plus[2] += yaw_reset
-            x_plus[3] *= max(0.05, 1.0 - speed_drop / (base_speed + 1e-3))
-            x_plus[4] += steer_effect * 0.8
-            x_plus[5] = float(np.hypot(x_plus[3], x_plus[4]))
-            x_plus[6] += yaw_reset / max(duration, 0.05)
-            x_plus[7] += np.arctan2(x_plus[4], max(abs(x_plus[3]), 1e-3))
-            x_plus[8] = steer
-            x_plus[9] = duration
+            x_plus[2] = new_yaw
+            x_plus[3] = vx1
+            x_plus[4] = vy1
+            x_plus[5] = yaw_rate0 + yaw_reset / max(duration, 0.05)
+            x_plus[6] = (vx1 - vx0) / max(duration, 0.05)
+            x_plus[7] = (vy1 - vy0) / max(duration, 0.05)
+            x_plus[8] = beta_plus
+            x_plus[9] = steer
+            x_plus[10] = brake
+            x_plus[11] = throttle
             # Degradation vector: steering/brake/throttle scale, delay, friction, damage norm.
             steering_scale = max(0.25, 1.0 - 0.12 * damage_class - rng.uniform(0, 0.08))
             brake_scale = max(0.25, 1.0 - 0.10 * damage_class - rng.uniform(0, 0.08))
@@ -144,10 +146,10 @@ def make_synthetic_rows(
             reset = np.asarray([
                 x_plus[3] - x_minus[3],
                 x_plus[4] - x_minus[4],
-                x_plus[5] - x_minus[5],
+                float(np.hypot(x_plus[3], x_plus[4]) - base_speed),
                 x_plus[2] - x_minus[2],
-                x_plus[6] - x_minus[6],
-                x_plus[7] - x_minus[7],
+                x_plus[5] - x_minus[5],
+                x_plus[8] - x_minus[8],
                 x_plus[1] - x_minus[1],
             ], dtype=np.float32)
             z[11:18] = reset
@@ -198,7 +200,7 @@ def make_synthetic_rows(
             # Teacher margins: positive safe. Constructed from actual mechanism fields.
             r_sec = secondary_clear - 2.0 - 0.4 * actor_density - 0.2 * abs(yaw_reset) + rng.normal(0, 0.3)
             r_road = clearance + 0.7 - 0.2 * abs(steer_effect) + rng.normal(0, 0.15)
-            r_stab = 1.6 * friction - abs(x_plus[6]) * 0.55 - abs(x_plus[7]) * 0.35 - 0.1 * base_speed / 10 + rng.normal(0, 0.15)
+            r_stab = 1.6 * friction - abs(x_plus[5]) * 0.55 - abs(x_plus[8]) * 0.35 - 0.1 * base_speed / 10 + rng.normal(0, 0.15)
             r_ctrl = min(steering_scale, brake_scale) - 0.35 - 0.25 * abs(steer) - 0.2 * delay + rng.normal(0, 0.08)
             r_return = 0.08 * return_length + 0.2 * r_road + 0.15 * r_sec - 1.2 * actor_density + rng.normal(0, 0.25)
             if family_id == 0:
@@ -218,6 +220,112 @@ def make_synthetic_rows(
             elif family_id == 7:
                 r_sec -= 0.9
             r_star = np.asarray([r_sec, r_road, r_stab, r_ctrl, r_return], dtype=np.float32)
+            if family_id == 4:
+                event_type = "boundary"
+            elif family_id == 5:
+                event_type = "stability"
+            elif family_id == 6:
+                event_type = "control"
+            elif contact:
+                event_type = "contact"
+            else:
+                event_type = "none"
+
+            # Lightweight local recovery-world tensor surrogates.  The MetaDrive
+            # generator exports richer geometry, but keeping the same keys here
+            # lets smoke tests exercise the revised MSRT/RPN interface.
+            world_plus = {
+                "drivable_crop": [
+                    float(lane_width),
+                    float(clearance),
+                    float(lane_width / 2.0 + base_y),
+                    float(lane_width / 2.0 - base_y),
+                    float(return_length),
+                    float(np.sign(route_dy)),
+                    float(boundary_side),
+                    float(friction),
+                ],
+                "future_occupancy": [
+                    float(actor_density),
+                    float(secondary_clear),
+                    float(max(0.0, 5.0 - secondary_clear)),
+                    float(rho_imp),
+                    float(contact),
+                    float(damage_class / 3.0),
+                    float(abs(steer_effect)),
+                    float(brake_effect),
+                ],
+                "actor_flow": [
+                    float(route_dx),
+                    float(route_dy),
+                    float(base_speed),
+                    float(new_speed),
+                    float(yaw_reset),
+                    float(lat_shift),
+                    float(actor_density * base_speed),
+                    float(secondary_clear / max(base_speed, 0.1)),
+                ],
+                "reachable_mask": [
+                    float(r_road > 0.0),
+                    float(r_sec > 0.0),
+                    float(r_stab > 0.0),
+                    float(r_ctrl > 0.0),
+                    float(r_return > 0.0),
+                    float(np.min(r_star) > 0.0),
+                    float(clearance > -0.2),
+                    float(return_length > 8.0),
+                ],
+                "goal_mask": [
+                    float(return_length),
+                    float(route_dy),
+                    float(max(0.0, clearance)),
+                    float(secondary_clear),
+                    float(friction),
+                    float(1.0 - actor_density),
+                    float(1.0 - damage_class / 3.0),
+                    float(new_speed),
+                ],
+            }
+
+            # Teacher recovery in the revised paper's control order:
+            # [steering delta, brake force, throttle force].
+            teacher_u = []
+            for k in range(RECOVERY_HORIZON):
+                alpha = k / max(1, RECOVERY_HORIZON - 1)
+                centering = -0.25 * np.sign(x_plus[1]) * min(1.0, abs(x_plus[1]) / max(1e-3, lane_width))
+                u_delta = float((1.0 - alpha) * centering + 0.10 * alpha * (-steer))
+                u_brake = float(max(0.0, min(1.0, 0.15 + 0.35 * (actor_density > 0.55) + 0.25 * (r_sec < 0.0))))
+                u_throttle = float(max(0.0, min(1.0, 0.35 * (r_return > 0.0) + 0.15 * (friction > 0.65) - 0.20 * u_brake)))
+                teacher_u.append([u_delta, u_brake, u_throttle])
+
+            teacher_traj = []
+            for k in range(RECOVERY_HORIZON + 1):
+                alpha = k / max(1, RECOVERY_HORIZON)
+                st = x_plus.astype(np.float32).copy()
+                st[0] += alpha * max(1.0, 0.25 * return_length)
+                st[1] *= (1.0 - 0.70 * alpha)
+                st[2] *= (1.0 - 0.50 * alpha)
+                st[3] = (1.0 - alpha) * st[3] + alpha * min(13.9, max(2.0, new_speed + 1.0))
+                st[4] *= (1.0 - 0.50 * alpha)
+                st[5] *= (1.0 - 0.60 * alpha)
+                st[6] *= (1.0 - 0.30 * alpha)
+                st[7] *= (1.0 - 0.30 * alpha)
+                st[8] *= (1.0 - 0.60 * alpha)
+                st[9:12] = teacher_u[min(k, RECOVERY_HORIZON - 1)] if RECOVERY_HORIZON > 0 else [0.0, 0.0, 0.0]
+                teacher_traj.append(st.tolist())
+
+            audit_mech = {
+                "has_contact": bool(contact),
+                "event_side": SIDE_NAMES[side_id],
+                "normal": normal.tolist(),
+                "clearance": float(clearance),
+                "impulse_proxy": float(rho_imp),
+                "reset": reset.tolist(),
+                "corridor": z[18:24].tolist(),
+                "degradation": d_deg.tolist(),
+                "timing_uncertainty": z[29:32].tolist(),
+            }
+
             row = {
                 "root_id": root_id,
                 "split": split,
@@ -229,14 +337,25 @@ def make_synthetic_rows(
                 "h_ctx": h_ctx.tolist(),
                 "rho_imp": rho_imp,
                 "harm_bin": int(harm_bin),
+                "x_t": x_minus.tolist(),
                 "x_minus": x_minus.tolist(),
                 "x_plus": x_plus.tolist(),
+                "event_type": event_type,
+                "event_time": float(duration),
+                "deg": d_deg.tolist(),
+                "world_plus": world_plus,
+                "teacher_u": teacher_u,
+                "teacher_traj": teacher_traj,
+                "m_star": r_star.tolist(),
+                "audit_mech": audit_mech,
+                # Backward-compatible aliases used by older scripts/checkpoints.
                 "d_deg": d_deg.tolist(),
                 "z_mech": z.tolist(),
                 "r_star": r_star.tolist(),
                 "b_star": int(np.argmin(r_star)),
                 "s_star": float(np.min(r_star)),
                 "calib_group": {
+                    "event_type": event_type,
                     "contact_type": "contact" if contact else "boundary",
                     "contact_side": SIDE_NAMES[side_id],
                     "boundary_side": "right" if boundary_side > 0 else "left",
