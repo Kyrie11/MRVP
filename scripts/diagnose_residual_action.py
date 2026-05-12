@@ -1,323 +1,73 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
 import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
-import argparse
-import json
+import argparse,json
 from pathlib import Path
-from typing import Any, Dict, Tuple
-
+from typing import Dict
 import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader,TensorDataset
 from tqdm import tqdm
-
-from mrvp.data.dataset import MRVPDataset, mrvp_collate
-from mrvp.data.schema import NUM_ACTIONS, TOKEN_COUNT, TOKEN_DIM, SchemaDims
+from mrvp.data.dataset import MRVPDataset,mrvp_collate
+from mrvp.data.schema import NUM_ACTIONS,TOKEN_COUNT,TOKEN_DIM,SchemaDims
 from mrvp.models.common import make_mlp
 from mrvp.models.msrt import MSRT
 from mrvp.training.checkpoints import load_model
 from mrvp.training.loops import to_device
-
-
 class Probe(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 128, target: str = "recoverable") -> None:
-        super().__init__()
-        out_dim = 1 if target == "recoverable" else 5
-        self.target = target
-        self.net = make_mlp(in_dim, [hidden_dim, hidden_dim], out_dim, dropout=0.05, layer_norm=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1) if self.target == "recoverable" else self.net(x)
-
-
-def auto_device(name: str) -> torch.device:
-    if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(name)
-
-
-def binary_auc(y_true: np.ndarray, prob: np.ndarray) -> float:
-    y = y_true.astype(np.int64).reshape(-1)
-    p = prob.astype(np.float64).reshape(-1)
-    pos = y == 1
-    neg = y == 0
-    n_pos = int(pos.sum())
-    n_neg = int(neg.sum())
-    if n_pos == 0 or n_neg == 0:
-        return float("nan")
-    order = np.argsort(p)
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(1, len(p) + 1, dtype=np.float64)
-    # Average ranks for ties.
-    sorted_p = p[order]
-    start = 0
-    while start < len(p):
-        end = start + 1
-        while end < len(p) and sorted_p[end] == sorted_p[start]:
-            end += 1
-        if end - start > 1:
-            avg = 0.5 * (start + 1 + end)
-            ranks[order[start:end]] = avg
-        start = end
-    rank_sum_pos = ranks[pos].sum()
-    return float((rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
-
-
-def balanced_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    y = y_true.astype(np.int64).reshape(-1)
-    p = y_pred.astype(np.int64).reshape(-1)
-    vals = []
-    for cls in [0, 1]:
-        mask = y == cls
-        if mask.sum() == 0:
-            continue
-        vals.append(float((p[mask] == cls).mean()))
-    return float(np.mean(vals)) if vals else float("nan")
-
-
-def macro_f1_np(y_true: np.ndarray, y_pred: np.ndarray, num_classes: int) -> float:
-    f1s = []
-    for c in range(num_classes):
-        tp = np.sum((y_true == c) & (y_pred == c))
-        fp = np.sum((y_true != c) & (y_pred == c))
-        fn = np.sum((y_true == c) & (y_pred != c))
-        denom = 2 * tp + fp + fn
-        f1s.append(0.0 if denom == 0 else float(2 * tp / denom))
-    return float(np.mean(f1s))
-
-
+    def __init__(self,in_dim,hidden_dim=128): super().__init__(); self.net=make_mlp(in_dim,[hidden_dim,hidden_dim],1,dropout=0.05,layer_norm=True)
+    def forward(self,x): return self.net(x).squeeze(-1)
+def auto_device(name): return torch.device('cuda' if name=='auto' and torch.cuda.is_available() else ('cpu' if name=='auto' else name))
+def auc(y,p):
+    y=np.asarray(y).astype(int); p=np.asarray(p); pos=y==1; neg=y==0
+    if pos.sum()==0 or neg.sum()==0: return float('nan')
+    order=np.argsort(p); ranks=np.empty_like(order,dtype=float); ranks[order]=np.arange(1,len(p)+1); return float((ranks[pos].sum()-pos.sum()*(pos.sum()+1)/2)/(pos.sum()*neg.sum()))
+def bacc(y,p): return float(np.mean([((p[y==c]==c).mean() if (y==c).sum() else np.nan) for c in [0,1]]))
 @torch.no_grad()
-def build_features(
-    data_path: str,
-    split: str,
-    feature_source: str,
-    msrt: MSRT | None,
-    device: torch.device,
-    batch_size: int,
-    token_count: int = TOKEN_COUNT,
-    token_dim: int = TOKEN_DIM,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    dims = SchemaDims(token_count=token_count, token_dim=token_dim)
-    ds = MRVPDataset(data_path, split=split, dims=dims)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=mrvp_collate)
-    x0_parts = []
-    x1_parts = []
-    y_rec_parts = []
-    y_b_parts = []
-    for batch in tqdm(loader, desc=f"features {split}", leave=False):
-        if feature_source == "predicted_msrt":
-            if msrt is None:
-                raise ValueError("--feature-source predicted_msrt requires --msrt")
-            mb = to_device(batch, device)
-            pred = msrt.sample(mb, num_samples=1, deterministic=True)
-            x_plus = pred["x_plus"].detach().cpu()
-            d_deg = pred["d_deg"].detach().cpu()
-            event_tokens = pred["event_tokens"].detach().cpu()
-            world_plus = pred["world_plus"].detach().cpu()
-        else:
-            x_plus = batch["x_plus"].float()
-            d_deg = batch["d_deg"].float()
-            event_tokens = batch["event_tokens"].float()
-            world_plus = batch["world_plus"].float()
-        h_ctx = batch["h_ctx"].float()
-        aid = batch["action_id"].long().clamp_min(0) % NUM_ACTIONS
-        action_onehot = F.one_hot(aid, NUM_ACTIONS).float()
-        action_feat = torch.cat([batch["action_vec"].float(), action_onehot], dim=-1)
-        x0 = torch.cat([x_plus, d_deg, event_tokens.flatten(1), world_plus, h_ctx], dim=-1)
-        x1 = torch.cat([x0, action_feat], dim=-1)
-        x0_parts.append(x0.numpy())
-        x1_parts.append(x1.numpy())
-        y_rec_parts.append((batch["s_star"].float() >= 0.0).long().numpy())
-        y_b_parts.append(batch["b_star"].long().numpy())
-    return (
-        np.concatenate(x0_parts, axis=0).astype(np.float32),
-        np.concatenate(x1_parts, axis=0).astype(np.float32),
-        np.concatenate(y_rec_parts, axis=0).astype(np.int64),
-        np.concatenate(y_b_parts, axis=0).astype(np.int64),
-    )
-
-
-def standardize(train: np.ndarray, val: np.ndarray, test: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
-    mean = train.mean(axis=0, keepdims=True)
-    std = train.std(axis=0, keepdims=True)
-    std = np.where(std < 1e-6, 1.0, std)
-    stats = {"mean_abs": float(np.abs(mean).mean()), "std_mean": float(std.mean())}
-    return ((train - mean) / std).astype(np.float32), ((val - mean) / std).astype(np.float32), ((test - mean) / std).astype(np.float32), stats
-
-
-def make_loader(x: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:
-    return DataLoader(TensorDataset(torch.from_numpy(x), torch.from_numpy(y)), batch_size=batch_size, shuffle=shuffle)
-
-
-def loss_for_logits(logits: torch.Tensor, y: torch.Tensor, target: str) -> torch.Tensor:
-    if target == "recoverable":
-        return F.binary_cross_entropy_with_logits(logits, y.float())
-    return F.cross_entropy(logits, y.long())
-
-
-@torch.no_grad()
-def evaluate_probe(model: Probe, loader: DataLoader, device: torch.device, target: str) -> Dict[str, float]:
-    model.eval()
-    losses = []
-    ys = []
-    outs = []
-    for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
-        logits = model(x)
-        losses.append(float(loss_for_logits(logits, y, target).detach().cpu()) * x.shape[0])
-        ys.append(y.detach().cpu().numpy())
-        outs.append(logits.detach().cpu().numpy())
-    y_np = np.concatenate(ys, axis=0)
-    out_np = np.concatenate(outs, axis=0)
-    nll = float(np.sum(losses) / max(1, len(y_np)))
-    if target == "recoverable":
-        prob = 1.0 / (1.0 + np.exp(-out_np))
-        pred = (prob >= 0.5).astype(np.int64)
-        return {
-            "nll": nll,
-            "auc": binary_auc(y_np, prob),
-            "balanced_acc": balanced_accuracy(y_np, pred),
-        }
-    pred = out_np.argmax(axis=-1).astype(np.int64)
-    return {
-        "nll": nll,
-        "macro_f1": macro_f1_np(y_np, pred, num_classes=5),
-        "acc": float((pred == y_np).mean()),
-    }
-
-
-def train_probe(
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    x_val: np.ndarray,
-    y_val: np.ndarray,
-    x_test: np.ndarray,
-    y_test: np.ndarray,
-    target: str,
-    hidden_dim: int,
-    epochs: int,
-    batch_size: int,
-    lr: float,
-    device: torch.device,
-    seed: int,
-) -> Dict[str, Any]:
-    torch.manual_seed(seed)
-    model = Probe(x_train.shape[1], hidden_dim=hidden_dim, target=target).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    train_loader = make_loader(x_train, y_train, batch_size=batch_size, shuffle=True)
-    val_loader = make_loader(x_val, y_val, batch_size=batch_size, shuffle=False)
-    test_loader = make_loader(x_test, y_test, batch_size=batch_size, shuffle=False)
-    best_state = None
-    best_val = float("inf")
-    history = []
-    for epoch in range(1, epochs + 1):
+def build_features(path,split,feature_source,msrt,device,batch_size,token_count,token_dim,admissible_only=False):
+    ds=MRVPDataset(path,split,SchemaDims(token_count=token_count,token_dim=token_dim)); loader=DataLoader(ds,batch_size=batch_size,shuffle=False,collate_fn=mrvp_collate); x0=[]; x1=[]; y=[]
+    for batch in tqdm(loader,desc=f'features {split}',leave=False):
+        mask=torch.ones(batch['s_star'].shape[0],dtype=torch.bool)
+        if admissible_only and 'is_harm_admissible' in batch: mask=batch['is_harm_admissible'].float()>0.5
+        if mask.sum()==0: continue
+        if feature_source=='predicted_msrt':
+            if msrt is None: raise ValueError('--feature-source predicted_msrt requires --msrt')
+            mb=to_device(batch,device); pred=msrt.sample(mb,num_samples=1,deterministic=True); x_plus=pred['x_plus'].cpu(); d=pred['d_deg'].cpu(); tok=pred['event_tokens'].cpu(); world=pred['world_plus'].cpu()
+        elif feature_source=='leaky_current': x_plus=batch['x_plus'].float(); d=batch['d_deg'].float(); tok=batch['z_mech'].float().view(batch['z_mech'].shape[0],1,-1).repeat(1,token_count,1)[...,:token_dim]; world=batch['world_plus'].float()
+        else: x_plus=batch['x_plus'].float(); d=batch['d_deg'].float(); tok=batch['event_tokens'].float(); world=batch['world_plus'].float()
+        h=batch['h_ctx'].float(); parts=[]
+        if feature_source in ['true_clean','predicted_msrt','leaky_current','xplus_only']: parts += [x_plus]
+        if feature_source in ['true_clean','predicted_msrt','leaky_current']: parts += [d,tok.flatten(1),world,h]
+        elif feature_source=='world_only': parts += [world]
+        elif feature_source=='tokens_only': parts += [tok.flatten(1)]
+        base=torch.cat(parts,-1); aid=batch['action_id'].long()%NUM_ACTIONS; action=torch.cat([batch['action_vec'].float(),F.one_hot(aid,NUM_ACTIONS).float()],-1); x0.append(base[mask].numpy()); x1.append(torch.cat([base,action],-1)[mask].numpy()); y.append((batch['s_star'].float()[mask]>=0).long().numpy())
+    return np.concatenate(x0).astype(np.float32),np.concatenate(x1).astype(np.float32),np.concatenate(y).astype(np.int64)
+def standardize(a,b,c):
+    m=a.mean(0,keepdims=True); s=a.std(0,keepdims=True); s=np.where(s<1e-6,1,s); return ((a-m)/s).astype(np.float32),((b-m)/s).astype(np.float32),((c-m)/s).astype(np.float32)
+def train_eval(xtr,ytr,xv,yv,xt,yt,epochs,batch,lr,hidden,device,seed):
+    torch.manual_seed(seed); model=Probe(xtr.shape[1],hidden).to(device); opt=torch.optim.AdamW(model.parameters(),lr=lr,weight_decay=1e-4); tr=DataLoader(TensorDataset(torch.from_numpy(xtr),torch.from_numpy(ytr)),batch_size=batch,shuffle=True); va=DataLoader(TensorDataset(torch.from_numpy(xv),torch.from_numpy(yv)),batch_size=batch); te=DataLoader(TensorDataset(torch.from_numpy(xt),torch.from_numpy(yt)),batch_size=batch)
+    best=None; bestn=1e99
+    for _ in range(epochs):
         model.train()
-        total = 0.0
-        seen = 0
-        for x, y in train_loader:
-            x = x.to(device)
-            y = y.to(device)
-            opt.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = loss_for_logits(logits, y, target)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step()
-            total += float(loss.detach().cpu()) * x.shape[0]
-            seen += x.shape[0]
-        val_metrics = evaluate_probe(model, val_loader, device, target)
-        train_nll = total / max(1, seen)
-        history.append({"epoch": epoch, "train_nll": train_nll, **{f"val_{k}": v for k, v in val_metrics.items()}})
-        if val_metrics["nll"] < best_val:
-            best_val = val_metrics["nll"]
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    return {"val": evaluate_probe(model, val_loader, device, target), "test": evaluate_probe(model, test_loader, device, target), "history": history}
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Residual-action sufficiency diagnostic. Probe0 sees (x_plus,deg,event_tokens,world_plus,h_ctx); "
-            "Probe1 additionally sees action_vec and action_id one-hot. A small Probe1-Probe0 gain supports event-token/world sufficiency."
-        )
-    )
-    parser.add_argument("--data", required=True)
-    parser.add_argument("--output", default="runs/default/residual_action_diagnostic.json")
-    parser.add_argument("--feature-source", choices=["true", "predicted_msrt"], default="true")
-    parser.add_argument("--msrt", default="")
-    parser.add_argument("--target", choices=["recoverable", "bottleneck"], default="recoverable")
-    parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--torch-threads", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--msrt-hidden-dim", type=int, default=256)
-    parser.add_argument("--mixture-count", type=int, default=5)
-    parser.add_argument("--token-count", type=int, default=TOKEN_COUNT)
-    parser.add_argument("--token-dim", type=int, default=TOKEN_DIM)
-    args = parser.parse_args()
-
-    torch.set_num_threads(max(1, args.torch_threads))
-    device = auto_device(args.device)
-    msrt = None
-    if args.feature_source == "predicted_msrt":
-        if not args.msrt:
-            raise SystemExit("--feature-source predicted_msrt requires --msrt")
-        msrt = MSRT(hidden_dim=args.msrt_hidden_dim, mixture_count=args.mixture_count, token_count=args.token_count, token_dim=args.token_dim).to(device)
-        load_model(msrt, args.msrt, device, strict=False)
-        msrt.eval()
-
-    x0_train, x1_train, y_rec_train, y_b_train = build_features(args.data, "train", args.feature_source, msrt, device, args.batch_size, args.token_count, args.token_dim)
-    x0_val, x1_val, y_rec_val, y_b_val = build_features(args.data, "val", args.feature_source, msrt, device, args.batch_size, args.token_count, args.token_dim)
-    x0_test, x1_test, y_rec_test, y_b_test = build_features(args.data, "test", args.feature_source, msrt, device, args.batch_size, args.token_count, args.token_dim)
-
-    y_train, y_val, y_test = (y_rec_train, y_rec_val, y_rec_test) if args.target == "recoverable" else (y_b_train, y_b_val, y_b_test)
-    x0_train_s, x0_val_s, x0_test_s, stats0 = standardize(x0_train, x0_val, x0_test)
-    x1_train_s, x1_val_s, x1_test_s, stats1 = standardize(x1_train, x1_val, x1_test)
-
-    probe0 = train_probe(x0_train_s, y_train, x0_val_s, y_val, x0_test_s, y_test, args.target, args.hidden_dim, args.epochs, args.batch_size, args.lr, device, args.seed)
-    probe1 = train_probe(x1_train_s, y_train, x1_val_s, y_val, x1_test_s, y_test, args.target, args.hidden_dim, args.epochs, args.batch_size, args.lr, device, args.seed + 1)
-
-    test0 = probe0["test"]
-    test1 = probe1["test"]
-    deltas: Dict[str, float] = {"delta_nll_probe1_minus_probe0": float(test1["nll"] - test0["nll"])}
-    if args.target == "recoverable":
-        deltas["delta_auc_probe1_minus_probe0"] = float(test1["auc"] - test0["auc"])
-        deltas["delta_balanced_acc_probe1_minus_probe0"] = float(test1["balanced_acc"] - test0["balanced_acc"])
-    else:
-        deltas["delta_macro_f1_probe1_minus_probe0"] = float(test1["macro_f1"] - test0["macro_f1"])
-        deltas["delta_acc_probe1_minus_probe0"] = float(test1["acc"] - test0["acc"])
-
-    out = {
-        "feature_source": args.feature_source,
-        "target": args.target,
-        "interpretation": {
-            "probe0_input": "x_plus,deg,event_tokens,world_plus,h_ctx",
-            "probe1_input": "x_plus,deg,event_tokens,world_plus,h_ctx,action_vec,action_id_onehot",
-            "rule_of_thumb": "Small or negative Probe1-Probe0 gain supports mechanism sufficiency; a large positive gain indicates residual action shortcut/leakage.",
-        },
-        "probe0_no_action": {"val": probe0["val"], "test": probe0["test"]},
-        "probe1_with_action": {"val": probe1["val"], "test": probe1["test"]},
-        "deltas": deltas,
-        "feature_stats": {"probe0": stats0, "probe1": stats1},
-        "sizes": {"train": int(len(y_train)), "val": int(len(y_val)), "test": int(len(y_test))},
-    }
-    path = Path(args.output)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(json.dumps({"output": str(path), "deltas": deltas}, indent=2, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()
+        for x,y in tr:
+            x=x.to(device); y=y.to(device).float(); opt.zero_grad(); loss=F.binary_cross_entropy_with_logits(model(x),y); loss.backward(); opt.step()
+        m=evaluate(model,va,device)
+        if m['nll']<bestn: bestn=m['nll']; best={k:v.cpu().clone() for k,v in model.state_dict().items()}
+    if best: model.load_state_dict(best)
+    return {'val':evaluate(model,va,device),'test':evaluate(model,te,device)}
+@torch.no_grad()
+def evaluate(model,loader,device):
+    ys=[]; ps=[]; losses=[]; model.eval()
+    for x,y in loader:
+        x=x.to(device); logit=model(x).cpu(); losses.append(F.binary_cross_entropy_with_logits(logit,y.float(),reduction='sum').item()); ys.append(y.numpy()); ps.append(torch.sigmoid(logit).numpy())
+    y=np.concatenate(ys); p=np.concatenate(ps); pred=(p>=0.5).astype(int); return {'nll':float(sum(losses)/max(1,len(y))),'auc':auc(y,p),'balanced_acc':bacc(y,pred)}
+def main():
+    p=argparse.ArgumentParser(description='Residual-action sufficiency diagnostic.'); p.add_argument('--data',required=True); p.add_argument('--output',default='runs/default/residual_action.json'); p.add_argument('--feature-source',choices=['true_clean','predicted_msrt','leaky_current','xplus_only','world_only','tokens_only','true'],default='true_clean'); p.add_argument('--msrt',default=''); p.add_argument('--epochs',type=int,default=15); p.add_argument('--batch-size',type=int,default=256); p.add_argument('--hidden-dim',type=int,default=128); p.add_argument('--lr',type=float,default=3e-4); p.add_argument('--device',default='auto'); p.add_argument('--torch-threads',type=int,default=1); p.add_argument('--seed',type=int,default=7); p.add_argument('--msrt-hidden-dim',type=int,default=256); p.add_argument('--mixture-count',type=int,default=5); p.add_argument('--token-count',type=int,default=TOKEN_COUNT); p.add_argument('--token-dim',type=int,default=TOKEN_DIM); p.add_argument('--admissible-only',action='store_true'); p.add_argument('--target',choices=['recoverable'],default='recoverable'); args=p.parse_args(); torch.set_num_threads(max(1,args.torch_threads)); device=auto_device(args.device); fs='true_clean' if args.feature_source=='true' else args.feature_source; msrt=None
+    if fs=='predicted_msrt': msrt=MSRT(hidden_dim=args.msrt_hidden_dim,mixture_count=args.mixture_count,token_count=args.token_count,token_dim=args.token_dim).to(device); load_model(msrt,args.msrt,device,strict=False); msrt.eval()
+    x0tr,x1tr,ytr=build_features(args.data,'train',fs,msrt,device,args.batch_size,args.token_count,args.token_dim,args.admissible_only); x0v,x1v,yv=build_features(args.data,'val',fs,msrt,device,args.batch_size,args.token_count,args.token_dim,args.admissible_only); x0t,x1t,yt=build_features(args.data,'test',fs,msrt,device,args.batch_size,args.token_count,args.token_dim,args.admissible_only); x0tr,x0v,x0t=standardize(x0tr,x0v,x0t); x1tr,x1v,x1t=standardize(x1tr,x1v,x1t); p0=train_eval(x0tr,ytr,x0v,yv,x0t,yt,args.epochs,args.batch_size,args.lr,args.hidden_dim,device,args.seed); p1=train_eval(x1tr,ytr,x1v,yv,x1t,yt,args.epochs,args.batch_size,args.lr,args.hidden_dim,device,args.seed+1); t0=p0['test']; t1=p1['test']; out={'feature_source':fs,'target':'recoverable','overall':{'probe0_auc':t0['auc'],'probe1_auc':t1['auc'],'delta_auc':t1['auc']-t0['auc'],'probe0_balanced_acc':t0['balanced_acc'],'probe1_balanced_acc':t1['balanced_acc'],'delta_balanced_acc':t1['balanced_acc']-t0['balanced_acc'],'probe0_nll':t0['nll'],'probe1_nll':t1['nll'],'delta_nll':t1['nll']-t0['nll']},'probe0_no_action':p0,'probe1_with_action':p1,'sizes':{'train':len(ytr),'val':len(yv),'test':len(yt)}}; Path(args.output).parent.mkdir(parents=True,exist_ok=True); Path(args.output).write_text(json.dumps(out,indent=2),encoding='utf-8'); print(json.dumps({'output':args.output,'overall':out['overall']},indent=2))
+if __name__=='__main__': main()
