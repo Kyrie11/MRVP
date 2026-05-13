@@ -40,11 +40,12 @@ def iter_jsonl(paths: str | Path | Sequence[str | Path]) -> Iterable[Dict[str, A
 
 
 class MRVPDataset(Dataset):
-    """PyTorch dataset for rows following the revised MRVP appendix schema.
+    """PyTorch dataset for MRVP reset-problem rows.
 
-    Preferred rows contain ``event_tokens`` and ``world_plus``.  Older rows that
-    only contain ``z_mech``/``d_deg``/``r_star`` are normalized into the same
-    tensor interface so existing experiments remain runnable.
+    The main tensor keys are ``reset_state``, ``reset_time``, ``degradation``,
+    ``recovery_world_vec`` and ``reset_slots``.  Legacy keys such as ``x_plus``
+    and ``world_plus`` are emitted as aliases so older checkpoints and scripts
+    can still be inspected.
     """
 
     def __init__(
@@ -78,37 +79,54 @@ class MRVPDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.rows[idx]
+        tensor_float = [
+            "action_vec",
+            "o_hist",
+            "h_ctx",
+            "x_t",
+            "rho_imp",
+            "reset_time",
+            "reset_state",
+            "degradation",
+            "recovery_world_vec",
+            "reset_slots",
+            "reset_slots_target",
+            "has_reset_slots_target",
+            "reset_slots_legacy",
+            "reset_uncertainty_target",
+            "audit_mech",
+            "teacher_u",
+            "teacher_traj",
+            "m_star",
+            "s_star",
+            # legacy aliases
+            "event_time",
+            "x_minus",
+            "x_plus",
+            "deg",
+            "d_deg",
+            "event_tokens",
+            "has_event_tokens",
+            "world_plus",
+            "z_mech",
+            "r_star",
+        ]
         item: Dict[str, Any] = {
             "idx": torch.tensor(idx, dtype=torch.long),
             "action_id": torch.tensor(row["action_id"], dtype=torch.long),
-            "action_vec": torch.as_tensor(row["action_vec"], dtype=torch.float32),
-            "o_hist": torch.as_tensor(row["o_hist"], dtype=torch.float32),
-            "h_ctx": torch.as_tensor(row["h_ctx"], dtype=torch.float32),
-            "x_t": torch.as_tensor(row["x_t"], dtype=torch.float32),
-            "rho_imp": torch.tensor(row["rho_imp"], dtype=torch.float32),
             "harm_bin": torch.tensor(row["harm_bin"], dtype=torch.long),
+            "audit_event_type_id": torch.tensor(row["audit_event_type_id"], dtype=torch.long),
             "event_type_id": torch.tensor(row["event_type_id"], dtype=torch.long),
-            "event_time": torch.tensor(row["event_time"], dtype=torch.float32),
-            "x_minus": torch.as_tensor(row["x_minus"], dtype=torch.float32),
-            "x_plus": torch.as_tensor(row["x_plus"], dtype=torch.float32),
-            "deg": torch.as_tensor(row["deg"], dtype=torch.float32),
-            "d_deg": torch.as_tensor(row["d_deg"], dtype=torch.float32),
-            "event_tokens": torch.as_tensor(row["event_tokens"], dtype=torch.float32),
-            "has_event_tokens": torch.as_tensor(row["has_event_tokens"], dtype=torch.float32),
-            "world_plus": torch.as_tensor(row["world_plus"], dtype=torch.float32),
-            "z_mech": torch.as_tensor(row["z_mech"], dtype=torch.float32),
-            "teacher_u": torch.as_tensor(row["teacher_u"], dtype=torch.float32),
-            "teacher_traj": torch.as_tensor(row["teacher_traj"], dtype=torch.float32),
-            "m_star": torch.as_tensor(row["m_star"], dtype=torch.float32),
-            "r_star": torch.as_tensor(row["r_star"], dtype=torch.float32),
             "b_star": torch.tensor(row["b_star"], dtype=torch.long),
-            "s_star": torch.tensor(row["s_star"], dtype=torch.float32),
-            "root_id": row["root_id"],
-            "split": row["split"],
-            "family": row["family"],
-            "event_type": row["event_type"],
-            "calib_group": row["calib_group"],
         }
+        for key in tensor_float:
+            val = row[key]
+            if np.isscalar(val):
+                item[key] = torch.tensor(val, dtype=torch.float32)
+            else:
+                item[key] = torch.as_tensor(val, dtype=torch.float32)
+        for key in ["root_id", "split", "family", "action_name", "audit_event_type", "event_type", "calib_group"]:
+            item[key] = row[key]
         return item
 
     def raw(self, idx: int) -> Optional[Dict[str, Any]]:
@@ -128,6 +146,23 @@ def mrvp_collate(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "x_t",
         "rho_imp",
         "harm_bin",
+        "reset_time",
+        "reset_state",
+        "degradation",
+        "recovery_world_vec",
+        "reset_slots",
+        "reset_slots_target",
+        "has_reset_slots_target",
+        "reset_slots_legacy",
+        "reset_uncertainty_target",
+        "audit_event_type_id",
+        "audit_mech",
+        "teacher_u",
+        "teacher_traj",
+        "m_star",
+        "b_star",
+        "s_star",
+        # legacy aliases
         "event_type_id",
         "event_time",
         "x_minus",
@@ -138,29 +173,17 @@ def mrvp_collate(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "has_event_tokens",
         "world_plus",
         "z_mech",
-        "teacher_u",
-        "teacher_traj",
-        "m_star",
         "r_star",
-        "b_star",
-        "s_star",
     ]
     for key in tensor_keys:
         out[key] = torch.stack([x[key] for x in batch], dim=0)
-    for key in ["root_id", "split", "family", "event_type", "calib_group"]:
+    for key in ["root_id", "split", "family", "action_name", "audit_event_type", "event_type", "calib_group"]:
         out[key] = [x[key] for x in batch]
     return out
 
 
 def iter_root_batches(dataset: MRVPDataset, shuffle: bool = False, seed: int = 0):
-    """Yield root-level batches without leaking counterfactual actions across roots.
-
-    Each yield is ``(root_id, indices, rows, batch)`` where ``indices`` are
-    dataset-local row indices, ``rows`` are the normalized row dictionaries and
-    ``batch`` is the standard tensor batch produced by ``mrvp_collate``. This
-    loader is intended for claim-level evaluation and action selection because
-    all candidate actions from the same root must be scored together.
-    """
+    """Yield root-level batches for counterfactual action selection."""
     root_ids = list(dataset.root_to_indices.keys())
     if shuffle:
         rng = np.random.default_rng(seed)

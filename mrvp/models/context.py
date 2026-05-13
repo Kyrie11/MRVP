@@ -11,7 +11,7 @@ from .common import make_mlp
 
 
 class SceneContextEncoder(nn.Module):
-    """Compact state/map encoder used by MSRT and RPN.
+    """Compact state/map encoder used by CMRT, RPFN and baselines.
 
     Inputs:
       o_hist: [B,T,A,F]

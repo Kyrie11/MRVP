@@ -81,6 +81,59 @@ def make_synthetic_rows(
         base_yaw = rng.normal(0, 0.15)
         route_dx = rng.uniform(20, 60)
         route_dy = rng.normal(0, 3)
+        root_yaw_rate0 = float(rng.normal(0, 0.05))
+        root_beta0 = float(rng.normal(0, 0.03))
+
+        # Root-scene context is shared by every counterfactual action.  Action-
+        # conditioned effects belong in the reset problem, not in h_ctx/o_hist.
+        root_secondary_clear = max(0.0, 12.0 - 7.0 * actor_density + rng.normal(0, 1.0))
+        root_return_length = max(0.0, route_dx - 3.0 * actor_density)
+        root_weather_wetness = float(rng.uniform(0, 1))
+        root_map_curvature = float(rng.normal(0, 0.02))
+        h_ctx_root = np.zeros(CTX_DIM, dtype=np.float32)
+        h_ctx_root[:16] = [
+            rng.normal(0, 0.03),
+            -base_yaw,
+            lane_width,
+            lane_width / 2 + base_y,
+            lane_width / 2 - base_y,
+            root_secondary_clear,
+            8.0,
+            root_secondary_clear,
+            max(0.1, root_secondary_clear / max(base_speed, 0.1)),
+            root_return_length,
+            actor_density,
+            13.9,
+            friction,
+            root_weather_wetness,
+            root_map_curvature,
+            lane_width,
+        ]
+        h_ctx_root[16:24] = [0.0, -base_y, route_dx, route_dy, 0.0, actor_density * 0.2, 1.0, boundary_side]
+        h_ctx_root[24:29] = [
+            int(town[-2:]) / 10.0,
+            family_id / max(1, len(FAMILIES) - 1),
+            1.0 if contact else 0.0,
+            damage_class / 3.0,
+            0.5,
+        ]
+        o_hist_root = np.zeros((HIST_LEN, MAX_AGENTS, ACTOR_FEAT_DIM), dtype=np.float32)
+        for t in range(HIST_LEN):
+            dt = (t - HIST_LEN + 1) * 0.1
+            o_hist_root[t, 0, :] = [base_x + base_speed * dt, base_y, base_yaw, base_speed, 0.0, 4.6, 1.9, 1.0, 1.0]
+            for ag in range(1, min(MAX_AGENTS, 1 + int(2 + actor_density * 8))):
+                o_hist_root[t, ag, :] = [
+                    base_x + rng.uniform(6, 35) + base_speed * dt * rng.uniform(0.5, 1.1),
+                    base_y + rng.normal(0, 3.2),
+                    rng.normal(0, 0.2),
+                    base_speed * rng.uniform(0.3, 1.2),
+                    rng.normal(0, 0.5),
+                    4.5,
+                    1.8,
+                    1.0,
+                    1.0,
+                ]
+
         for a in range(actions_per_root):
             action_name = ACTION_NAMES[a % len(ACTION_NAMES)]
             action_vec = ACTION_VECTORS[a % len(ACTION_VECTORS)].astype(float)
@@ -99,9 +152,9 @@ def make_synthetic_rows(
             x_minus = np.zeros(STATE_DIM, dtype=np.float32)
             vx0 = float(base_speed * np.cos(base_yaw))
             vy0 = float(base_speed * np.sin(base_yaw))
-            yaw_rate0 = float(rng.normal(0, 0.05))
-            beta0 = float(rng.normal(0, 0.03))
-            x_minus[:] = [base_x, base_y, base_yaw, vx0, vy0, yaw_rate0, 0.0, 0.0, beta0, steer, brake, throttle]
+            yaw_rate0 = root_yaw_rate0
+            beta0 = root_beta0
+            x_minus[:] = [base_x, base_y, base_yaw, vx0, vy0, yaw_rate0, 0.0, 0.0, beta0, 0.0, 0.0, 0.0]
             yaw_reset = (0.15 + 0.05 * family_id) * steer_effect + (0.08 * damage_class) * rng.normal()
             speed_drop = (2.0 * brake_effect + 0.25 * rho_imp + rng.normal(0, 0.25)) if contact else 1.0 * brake_effect
             lat_shift = 0.4 * steer_effect + rng.normal(0, 0.15)
@@ -197,6 +250,10 @@ def make_synthetic_rows(
                         1.0,
                         1.0,
                     ]
+            # Re-use the same root scene across all candidate actions.
+            h_ctx = h_ctx_root.copy()
+            o_hist = o_hist_root.copy()
+
             # Teacher margins: positive safe. Constructed from actual mechanism fields.
             r_sec = secondary_clear - 2.0 - 0.4 * actor_density - 0.2 * abs(yaw_reset) + rng.normal(0, 0.3)
             r_road = clearance + 0.7 - 0.2 * abs(steer_effect) + rng.normal(0, 0.15)
@@ -231,61 +288,67 @@ def make_synthetic_rows(
             else:
                 event_type = "none"
 
-            # Lightweight local recovery-world tensor surrogates.  The MetaDrive
-            # generator exports richer geometry, but keeping the same keys here
-            # lets smoke tests exercise the revised MSRT/RPN interface.
-            world_plus = {
-                "drivable_crop": [
+            # Lightweight reset boundary and recovery-world construction.
+            # The boundary is a cheap approximation of the hardest point along
+            # the prefix, not simply the prefix end.
+            prefix_scores = np.asarray([
+                clearance,
+                secondary_clear - 2.0 - 0.25 * actor_density,
+                friction - 0.20 * abs(yaw_reset),
+                min(steering_scale, brake_scale) - 0.30 - 0.10 * abs(steer),
+            ], dtype=np.float32)
+            difficulty = float(np.clip(0.5 - np.min(prefix_scores), -1.0, 1.0))
+            reset_alpha = float(np.clip(0.45 + 0.25 * difficulty + 0.15 * abs(steer_effect), 0.15, 0.95))
+            reset_state = ((1.0 - reset_alpha) * x_minus + reset_alpha * x_plus).astype(np.float32)
+            reset_state[9:12] = [steer, brake, throttle]
+            reset_time = float(duration * reset_alpha)
+
+            # A/O/G/Y recovery world.  These inputs use scene geometry, actor
+            # summaries, route/refuge information and degradation context only;
+            # teacher margins m_star/s_star are intentionally not copied.
+            recovery_world = {
+                "affordance": [
                     float(lane_width),
                     float(clearance),
                     float(lane_width / 2.0 + base_y),
                     float(lane_width / 2.0 - base_y),
                     float(return_length),
-                    float(np.sign(route_dy)),
                     float(boundary_side),
                     float(friction),
+                    float(13.9),
                 ],
-                "future_occupancy": [
+                "occupancy": [
                     float(actor_density),
                     float(secondary_clear),
+                    float(max(0.1, secondary_clear / max(base_speed, 0.1))),
                     float(max(0.0, 5.0 - secondary_clear)),
-                    float(rho_imp),
-                    float(contact),
-                    float(damage_class / 3.0),
-                    float(abs(steer_effect)),
-                    float(brake_effect),
+                    float(actor_density * base_speed),
+                    float(abs(route_dy)),
+                    float(max(0.0, 1.0 - actor_density)),
+                    float(occlusion_score if 'occlusion_score' in locals() else actor_density * 0.2),
                 ],
-                "actor_flow": [
+                "goal": [
                     float(route_dx),
                     float(route_dy),
+                    float(return_length),
+                    float(-base_y),
+                    float(np.sign(route_dy)),
+                    float(max(0.0, clearance)),
+                    float(1.0),
+                    float(new_speed),
+                ],
+                "actor_response": [
                     float(base_speed),
                     float(new_speed),
                     float(yaw_reset),
                     float(lat_shift),
-                    float(actor_density * base_speed),
-                    float(secondary_clear / max(base_speed, 0.1)),
-                ],
-                "reachable_mask": [
-                    float(r_road > 0.0),
-                    float(r_sec > 0.0),
-                    float(r_stab > 0.0),
-                    float(r_ctrl > 0.0),
-                    float(r_return > 0.0),
-                    float(np.min(r_star) > 0.0),
-                    float(clearance > -0.2),
-                    float(return_length > 8.0),
-                ],
-                "goal_mask": [
-                    float(return_length),
-                    float(route_dy),
-                    float(max(0.0, clearance)),
-                    float(secondary_clear),
-                    float(friction),
-                    float(1.0 - actor_density),
-                    float(1.0 - damage_class / 3.0),
-                    float(new_speed),
+                    float(damage_class / 3.0),
+                    float(delay),
+                    float(brake_effect),
+                    float(abs(steer_effect)),
                 ],
             }
+            world_plus = recovery_world
 
             # Teacher recovery in the revised paper's control order:
             # [steering delta, brake force, throttle force].
@@ -301,7 +364,7 @@ def make_synthetic_rows(
             teacher_traj = []
             for k in range(RECOVERY_HORIZON + 1):
                 alpha = k / max(1, RECOVERY_HORIZON)
-                st = x_plus.astype(np.float32).copy()
+                st = reset_state.astype(np.float32).copy()
                 st[0] += alpha * max(1.0, 0.25 * return_length)
                 st[1] *= (1.0 - 0.70 * alpha)
                 st[2] *= (1.0 - 0.50 * alpha)
@@ -339,6 +402,11 @@ def make_synthetic_rows(
                 "harm_bin": int(harm_bin),
                 "x_t": x_minus.tolist(),
                 "x_minus": x_minus.tolist(),
+                "reset_state": reset_state.tolist(),
+                "reset_time": reset_time,
+                "degradation": d_deg.tolist(),
+                "reset_uncertainty_target": z[29:32].astype(float).tolist(),
+                "recovery_world": recovery_world,
                 "x_plus": x_plus.tolist(),
                 "event_type": event_type,
                 "event_time": float(duration),
@@ -347,6 +415,11 @@ def make_synthetic_rows(
                 "teacher_u": teacher_u,
                 "teacher_traj": teacher_traj,
                 "m_star": r_star.tolist(),
+                "audit": {
+                    "event_type": event_type,
+                    "event_side": SIDE_NAMES[side_id],
+                    "notes": "diagnostic only"
+                },
                 "audit_mech": audit_mech,
                 # Backward-compatible aliases used by older scripts/checkpoints.
                 "d_deg": d_deg.tolist(),

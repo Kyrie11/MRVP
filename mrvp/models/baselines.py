@@ -28,8 +28,8 @@ class _ProfileLossMixin:
 class DirectActionRiskNetwork(nn.Module, _ProfileLossMixin):
     """Experiment baseline: predict recoverability directly from scene/action/harm.
 
-    It deliberately avoids MSRT mechanism branches, testing whether mechanism
-    variables prevent action shortcuts.
+    It deliberately avoids the CMRT/RPFN reset-program path, testing whether
+    direct action features create shortcuts.
     """
 
     def __init__(self, hidden_dim: int = 256, bottlenecks: int = len(BOTTLE_NECKS), scalar: bool = False) -> None:

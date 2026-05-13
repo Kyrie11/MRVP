@@ -13,22 +13,15 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from mrvp.calibration import load_calibration_table, lower_bounds_for_rows, predict_rpn, quantile_for_group
-from mrvp.data.dataset import MRVPDataset, iter_root_batches
-from mrvp.data.schema import BOTTLE_NECKS, TOKEN_COUNT, TOKEN_DIM, STRATEGY_COUNT, RECOVERY_HORIZON, SchemaDims
-from mrvp.evaluation import (
-    baseline_scores,
-    evaluate_selected_indices,
-    evaluate_selection,
-    lower_bounds_from_scalar_scores,
-)
-from mrvp.models.baselines import DirectActionRiskNetwork, UnstructuredLatentRiskNetwork
-from mrvp.models.common import empirical_cvar
-from mrvp.models.msrt import MSRT
-from mrvp.models.rpn import RecoveryProfileNetwork
-from mrvp.selection import admissible_indices
+from mrvp.action_selection import harm_comparable_indices, select_tail_consistent_action
+from mrvp.data.dataset import MRVPDataset, iter_root_batches, mrvp_collate
+from mrvp.data.schema import BOTTLE_NECKS, RECOVERY_HORIZON, PROGRAM_COUNT, RESET_SLOT_COUNT, RESET_SLOT_DIM, SchemaDims
+from mrvp.evaluation import baseline_scores, evaluate_selected_indices, evaluate_selection, lower_bounds_from_scalar_scores
+from mrvp.models.cmrt import CounterfactualMotionResetTokenizer
+from mrvp.models.rpfn import RecoveryProgramFunnelNetwork
 from mrvp.training.checkpoints import load_model
 from mrvp.training.loops import to_device
 
@@ -39,88 +32,16 @@ def auto_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def build_profile_model(model_type: str, hidden_dim: int, scalar: bool = False):
-    if model_type == "rpn":
-        return RecoveryProfileNetwork(hidden_dim=hidden_dim, scalar=scalar)
-    if model_type == "direct_action_to_risk":
-        return DirectActionRiskNetwork(hidden_dim=hidden_dim, scalar=scalar)
-    if model_type == "unstructured_latent":
-        return UnstructuredLatentRiskNetwork(hidden_dim=hidden_dim)
-    raise ValueError(f"Unknown model_type: {model_type}")
-
-
 @torch.no_grad()
-def score_root_with_msrt(
-    root_batch: Dict[str, Any],
-    root_rows: Sequence[Mapping[str, Any]],
-    msrt: torch.nn.Module,
-    rpn: torch.nn.Module,
-    calibration_table: Mapping[str, Any],
-    num_samples: int,
-    beta: float,
-    device: torch.device,
-) -> List[Dict[str, Any]]:
-    """Score every action in one root by MSRT samples -> RPN -> calibration -> CVaR.
-
-    Returns one summary per local action. Selection should still be restricted
-    to the minimum-harm-bin admissible set by the caller.
-    """
-    batch = to_device(root_batch, device)
-    summaries: List[Dict[str, Any]] = []
-    for local_idx, row in enumerate(root_rows):
-        single: Dict[str, Any] = {}
-        for k, v in batch.items():
-            if torch.is_tensor(v):
-                single[k] = v[local_idx : local_idx + 1]
-            else:
-                single[k] = [v[local_idx]] if isinstance(v, list) else v
-        samples = msrt.sample(single, num_samples=num_samples, deterministic=False)
-        rep = {
-            "o_hist": single["o_hist"].repeat_interleave(num_samples, dim=0),
-            "h_ctx": single["h_ctx"].repeat_interleave(num_samples, dim=0),
-            "x_plus": samples["x_plus"],
-            "deg": samples["deg"],
-            "d_deg": samples["d_deg"],
-            "event_tokens": samples["event_tokens"],
-            "world_plus": samples["world_plus"],
-            "z_mech": samples["z_mech"],
-        }
-        pred = rpn(rep)["r_hat"]
-        q = torch.as_tensor(
-            quantile_for_group(row.get("calib_group", {}), calibration_table),
-            device=device,
-            dtype=pred.dtype,
-        )
-        lower = pred - q[None, :]
-        v_lower = lower.min(dim=-1).values
-        losses = torch.clamp(-v_lower, min=0.0)
-        cvar = empirical_cvar(losses[None, :], beta=beta, dim=-1).squeeze(0)
-        mean_risk = losses.mean()
-        mean_lower = lower.mean(dim=0)
-        summaries.append(
-            {
-                "local_index": int(local_idx),
-                "action_id": int(row["action_id"]),
-                "action_name": row.get("action_name", str(row["action_id"])),
-                "harm_bin": int(row["harm_bin"]),
-                "risk_cvar": float(cvar.detach().cpu()),
-                "risk_mean": float(mean_risk.detach().cpu()),
-                "score_cvar": float(-cvar.detach().cpu()),
-                "score_mean": float(-mean_risk.detach().cpu()),
-                "mean_lower_V": float(v_lower.mean().detach().cpu()),
-                "p_violation": float((losses > 0).float().mean().detach().cpu()),
-                "mean_lower_bounds": mean_lower.detach().cpu().numpy().astype(float).tolist(),
-            }
-        )
-    return summaries
-
-
-def select_from_root_summaries(root_rows: Sequence[Mapping[str, Any]], summaries: Sequence[Mapping[str, Any]], risk_key: str) -> int:
-    adm = admissible_indices(root_rows)
-    if not adm:
-        raise ValueError("No admissible action for root.")
-    best = min(adm, key=lambda i: float(summaries[i][risk_key]))
-    return int(best)
+def predict_rpfn_profiles(rpfn: torch.nn.Module, ds: MRVPDataset, batch_size: int, device: torch.device) -> np.ndarray:
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=mrvp_collate)
+    out = []
+    rpfn.eval().to(device)
+    for batch in tqdm(loader, desc="oracle_rpfn", leave=False):
+        batch = to_device(batch, device)
+        pred = rpfn(batch)["best_profile"].detach().cpu().numpy()
+        out.append(pred)
+    return np.concatenate(out, axis=0) if out else np.zeros((0, len(BOTTLE_NECKS)), dtype=np.float32)
 
 
 def write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -131,103 +52,83 @@ def write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Claim-level evaluation: Oracle-MRVP uses true x_plus/d/z; "
-            "Predicted-MRVP samples MSRT from pre-impact scene/action and then runs RPN + calibration + CVaR."
-        )
-    )
+    parser = argparse.ArgumentParser(description="Evaluate full predicted MRVP: CMRT samples -> RPFN programs -> lower-tail CVaR.")
     parser.add_argument("--data", required=True)
-    parser.add_argument("--msrt", required=True)
-    parser.add_argument("--rpn", required=True)
-    parser.add_argument("--calibration", default="")
+    parser.add_argument("--cmrt", required=True)
+    parser.add_argument("--rpfn", required=True)
     parser.add_argument("--split", default="test")
     parser.add_argument("--output", default="runs/default/eval_predicted_mrvp.json")
-    parser.add_argument("--num-samples", type=int, default=32)
+    parser.add_argument("--num-reset-samples", type=int, default=16)
     parser.add_argument("--beta", type=float, default=0.2)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--mixture-count", type=int, default=5)
-    parser.add_argument("--token-count", type=int, default=TOKEN_COUNT)
-    parser.add_argument("--token-dim", type=int, default=TOKEN_DIM)
-    parser.add_argument("--strategy-count", type=int, default=STRATEGY_COUNT)
+    parser.add_argument("--reset-slot-count", type=int, default=RESET_SLOT_COUNT)
+    parser.add_argument("--reset-slot-dim", type=int, default=RESET_SLOT_DIM)
+    parser.add_argument("--program-count", type=int, default=PROGRAM_COUNT)
     parser.add_argument("--recovery-horizon", type=int, default=RECOVERY_HORIZON)
-    parser.add_argument("--scalar-rpn", action="store_true")
-    parser.add_argument("--direct-model", default="", help="Optional trained direct_action_to_risk checkpoint.")
-    parser.add_argument("--direct-calibration", default="", help="Optional calibration table for the direct baseline.")
-    parser.add_argument("--direct-model-type", choices=["direct_action_to_risk", "unstructured_latent"], default="direct_action_to_risk")
+    parser.add_argument("--scalar-rpfn", action="store_true")
+    parser.add_argument("--calibration", default="", help="Optional legacy argument; calibration is not required by the default MRVP selector.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1)
+    # Legacy aliases.
+    parser.add_argument("--msrt", dest="cmrt", help=argparse.SUPPRESS)
+    parser.add_argument("--rpn", dest="rpfn", help=argparse.SUPPRESS)
+    parser.add_argument("--num-samples", dest="num_reset_samples", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--token-count", dest="reset_slot_count", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--token-dim", dest="reset_slot_dim", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--strategy-count", dest="program_count", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--scalar-rpn", dest="scalar_rpfn", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     torch.set_num_threads(max(1, args.torch_threads))
     device = auto_device(args.device)
-    dims = SchemaDims(token_count=args.token_count, token_dim=args.token_dim, recovery_horizon=args.recovery_horizon)
+    dims = SchemaDims(reset_slot_count=args.reset_slot_count, reset_slot_dim=args.reset_slot_dim, program_count=args.program_count, recovery_horizon=args.recovery_horizon)
     ds = MRVPDataset(args.data, split=args.split, dims=dims)
+    cmrt = CounterfactualMotionResetTokenizer(hidden_dim=args.hidden_dim, mixture_count=args.mixture_count, reset_slot_count=args.reset_slot_count, reset_slot_dim=args.reset_slot_dim).to(device)
+    rpfn = RecoveryProgramFunnelNetwork(hidden_dim=args.hidden_dim, reset_slot_count=args.reset_slot_count, reset_slot_dim=args.reset_slot_dim, program_count=args.program_count, recovery_horizon=args.recovery_horizon, scalar=args.scalar_rpfn).to(device)
+    load_model(cmrt, args.cmrt, device, strict=False)
+    load_model(rpfn, args.rpfn, device, strict=False)
+    cmrt.eval(); rpfn.eval()
 
-    msrt = MSRT(hidden_dim=args.hidden_dim, mixture_count=args.mixture_count, token_count=args.token_count, token_dim=args.token_dim).to(device)
-    load_model(msrt, args.msrt, device, strict=False)
-    msrt.eval()
-    rpn = RecoveryProfileNetwork(hidden_dim=args.hidden_dim, token_count=args.token_count, token_dim=args.token_dim, strategy_count=args.strategy_count, recovery_horizon=args.recovery_horizon, scalar=args.scalar_rpn).to(device)
-    load_model(rpn, args.rpn, device, strict=False)
-    rpn.eval()
-    table = load_calibration_table(args.calibration or None)
-
-    # Oracle upper-bound path: RPN consumes true transition/mechanism labels.
-    oracle_r_hat = predict_rpn(rpn, ds, batch_size=args.batch_size, device=device)
-    oracle_lower = lower_bounds_for_rows(oracle_r_hat, ds.rows, table)
+    oracle_profiles = predict_rpfn_profiles(rpfn, ds, args.batch_size, device)
     results: Dict[str, Dict[str, float]] = {
-        "Oracle_MRVP_true_transition": evaluate_selection(ds.rows, oracle_lower, oracle_r_hat),
-        "Oracle_MRVP_uncalibrated": evaluate_selection(ds.rows, oracle_r_hat, oracle_r_hat),
+        "Oracle_MRVP_true_reset_problem": evaluate_selection(ds.rows, oracle_profiles, oracle_profiles),
     }
 
-    # Predicted path: score all actions in root batches, then select only within the harm gate.
-    scores_cvar = np.full((len(ds),), np.nan, dtype=np.float32)
-    scores_mean = np.full((len(ds),), np.nan, dtype=np.float32)
+    scores_lcvar = np.full((len(ds),), np.nan, dtype=np.float32)
     lower_mean = np.zeros((len(ds), len(BOTTLE_NECKS)), dtype=np.float32)
-    selected_cvar: List[int] = []
-    selected_mean: List[int] = []
+    selected_lcvar: List[int] = []
     per_root: List[Dict[str, Any]] = []
-
-    for root_id, indices, root_rows, root_batch in tqdm(iter_root_batches(ds), total=len(ds.root_to_indices), desc="predicted_mrvp"):
-        summaries = score_root_with_msrt(root_batch, root_rows, msrt, rpn, table, args.num_samples, args.beta, device)
-        best_cvar_local = select_from_root_summaries(root_rows, summaries, risk_key="risk_cvar")
-        best_mean_local = select_from_root_summaries(root_rows, summaries, risk_key="risk_mean")
-        selected_cvar.append(indices[best_cvar_local])
-        selected_mean.append(indices[best_mean_local])
-        for local_i, global_i in enumerate(indices):
-            scores_cvar[global_i] = summaries[local_i]["score_cvar"]
-            scores_mean[global_i] = summaries[local_i]["score_mean"]
-            lower_mean[global_i] = np.asarray(summaries[local_i]["mean_lower_bounds"], dtype=np.float32)
-        adm = admissible_indices(root_rows)
+    for root_id, indices, root_rows, root_batch in tqdm(iter_root_batches(ds), total=len(ds.root_to_indices), desc="predicted_cmrt_rpfn"):
+        sel = select_tail_consistent_action(root_batch, root_rows, cmrt, rpfn, num_samples=args.num_reset_samples, beta=args.beta, device=device)
+        selected_lcvar.append(indices[sel["selected_local_index"]])
+        for s in sel["candidate_summaries"]:
+            local_i = int(s["candidate_index"])
+            global_i = indices[local_i]
+            scores_lcvar[global_i] = float(s["score_lcvar"])
+            lower_mean[global_i, :] = float(s["mean_certificate"])
+        adm = harm_comparable_indices(root_rows)
         teacher_local = max(adm, key=lambda i: float(root_rows[i]["s_star"])) if adm else 0
         per_root.append(
             {
                 "root_id": root_id,
                 "admissible_local_indices": adm,
-                "selected_cvar_local": best_cvar_local,
-                "selected_cvar_global": indices[best_cvar_local],
-                "selected_mean_local": best_mean_local,
-                "selected_mean_global": indices[best_mean_local],
+                "selected_local": sel["selected_local_index"],
+                "selected_global": indices[sel["selected_local_index"]],
+                "selected_action_id": sel["selected_action_id"],
+                "tail_sample_index": sel["tail_sample_index"],
+                "program_index": sel["program_index"],
                 "teacher_best_local": teacher_local,
                 "teacher_best_global": indices[teacher_local],
-                "selected_cvar_s_star": float(root_rows[best_cvar_local]["s_star"]),
-                "selected_mean_s_star": float(root_rows[best_mean_local]["s_star"]),
+                "selected_s_star": float(root_rows[sel["selected_local_index"]]["s_star"]),
                 "teacher_best_s_star": float(root_rows[teacher_local]["s_star"]),
-                "candidate_summaries": summaries,
+                "candidate_summaries": sel["candidate_summaries"],
             }
         )
 
-    results["Predicted_MRVP_MSRT_CVaR"] = evaluate_selected_indices(ds.rows, selected_cvar, scores=scores_cvar, lower_bounds=lower_mean)
-    results["Predicted_MRVP_MSRT_mean_risk"] = evaluate_selected_indices(ds.rows, selected_mean, scores=scores_mean, lower_bounds=lower_mean)
-
-    if args.direct_model:
-        direct = build_profile_model(args.direct_model_type, args.hidden_dim, scalar=args.scalar_rpn).to(device)
-        load_model(direct, args.direct_model, device, strict=False)
-        direct_r_hat = predict_rpn(direct, ds, batch_size=args.batch_size, device=device)
-        direct_table = load_calibration_table(args.direct_calibration or None)
-        direct_lower = lower_bounds_for_rows(direct_r_hat, ds.rows, direct_table)
-        results[f"Direct_baseline_{args.direct_model_type}"] = evaluate_selection(ds.rows, direct_lower, direct_r_hat)
+    results["Predicted_MRVP_CMRT_RPFN_LCVaR"] = evaluate_selected_indices(ds.rows, selected_lcvar, scores=scores_lcvar, lower_bounds=lower_mean)
+    results["Predicted_MRVP_CMRT_RPFN_mean_certificate"] = evaluate_selected_indices(ds.rows, selected_lcvar, scores=scores_lcvar, lower_bounds=lower_mean)
 
     for name, kind in [("Severity_only", "severity"), ("Weighted_post_impact_cost", "weighted_post_impact"), ("Teacher_oracle", "teacher_oracle")]:
         base_scores = baseline_scores(ds.rows, kind=kind)
@@ -246,20 +147,7 @@ def main() -> None:
             writer.writerow({"method": method, **vals})
     detail_path = out.with_name(out.stem + "_per_root.jsonl")
     write_jsonl(detail_path, per_root)
-    print(
-        json.dumps(
-            {
-                "output": str(out),
-                "csv": str(csv_path),
-                "per_root": str(detail_path),
-                "methods": list(results.keys()),
-                "roots": len(ds.root_to_indices),
-                "rows": len(ds),
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-    )
+    print(json.dumps({"output": str(out), "csv": str(csv_path), "per_root": str(detail_path), "methods": list(results.keys()), "roots": len(ds.root_to_indices), "rows": len(ds)}, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

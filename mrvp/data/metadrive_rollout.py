@@ -734,7 +734,7 @@ def _degraded_reachability_features(scene: RootScene, x_plus: np.ndarray, deg: n
     ]
 
 
-def _world_plus_from_post_event(scene: RootScene, result: RolloutResult, deg: np.ndarray, horizon: float = 3.0, dt: float = 0.2) -> Dict[str, Any]:
+def _recovery_world_from_reset(scene: RootScene, result: RolloutResult, deg: np.ndarray, horizon: float = 3.0, dt: float = 0.2) -> Dict[str, Any]:
     """Build clean post-event recovery world without teacher-label leakage.
 
     Inputs are restricted to static scene information, the post-event state
@@ -771,13 +771,17 @@ def _world_plus_from_post_event(scene: RootScene, result: RolloutResult, deg: np
     route_dx_rel = float(scene.route_dx - float(x_plus[InternalIdx.X]))
     route_dy_rel = float(scene.route_dy - float(x_plus[InternalIdx.Y]))
     return {
-        "drivable_crop": [
-            float(road_clear_now),
+        "affordance": [
             float(scene.road_half_width * 2.0),
             float(scene.lane_width),
+            float(road_clear_now),
             float(abs(float(x_plus[InternalIdx.Y])) / max(scene.road_half_width, 1e-3)),
+            float(scene.boundary_side),
+            float(scene.friction),
+            float(scene.weather_wetness),
+            *_degraded_reachability_features(scene, x_plus, deg, horizon=horizon),
         ],
-        "future_occupancy": [
+        "occupancy": [
             float(scene.actor_density),
             float(sec_clear_now),
             float(np.min(occ_min) if occ_min else sec_clear_now),
@@ -786,18 +790,8 @@ def _world_plus_from_post_event(scene: RootScene, result: RolloutResult, deg: np
             float(np.max(side_counts) if side_counts else 0.0),
             float(len(scene.actors)),
         ],
-        "actor_flow": [mean_vx, mean_vy, max_speed, std_speed],
-        "reachable_mask": _degraded_reachability_features(scene, x_plus, deg, horizon=horizon),
-        "goal_mask": [
-            route_dx_rel,
-            route_dy_rel,
-            float(scene.boundary_side),
-            float(route_dx_rel > 0.0),
-        ],
-        "static_obstacles": [float(scene.road_half_width), float(scene.lane_width), float(scene.weather_wetness)],
-        "dynamic_actors": [nearest_dx, nearest_dy, nearest_vx, nearest_vy],
-        "route_mask": [route_dx_rel, route_dy_rel, float(scene.route_dx), float(scene.route_dy)],
-        "refuge_mask": [route_dx_rel, route_dy_rel, float(max(0.0, road_clear_now)), float(max(0.0, sec_clear_now))],
+        "goal": [route_dx_rel, route_dy_rel, float(scene.route_dx), float(scene.route_dy), float(scene.boundary_side), float(route_dx_rel > 0.0)],
+        "actor_response": [mean_vx, mean_vy, max_speed, std_speed, nearest_dx, nearest_dy, nearest_vx, nearest_vy],
     }
 
 
@@ -883,7 +877,25 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
     # (delta, F_b, F_x).
     teacher_u = [[float(c[0]), float(c[2]), float(c[1])] for c in result.recovery_controls]
     teacher_traj = _paper_traj_from_internal(result.recovery_traj, result.recovery_controls)
-    world_plus = _world_plus_from_post_event(scene, result, deg)
+    recovery_world = _recovery_world_from_reset(scene, result, deg)
+    # Lightweight reset boundary: choose the prefix state with the smallest
+    # hand-computed recovery margin instead of always using the prefix end.
+    best_idx = len(result.transition_traj) - 1
+    best_score = float("inf")
+    for k, st in enumerate(result.transition_traj):
+        road_m = _road_clearance(scene, st)
+        sec_m, _ = _min_actor_clearance(scene, st)
+        yaw_rate = abs(float(st[InternalIdx.YAW_RATE])) if st.shape[0] > InternalIdx.YAW_RATE else 0.0
+        beta = abs(float(st[InternalIdx.BETA])) if st.shape[0] > InternalIdx.BETA else 0.0
+        stab_m = 1.4 * scene.friction - 0.55 * yaw_rate - 0.35 * beta
+        ctrl_m = min(steering_scale, brake_scale) - 0.35
+        score = min(road_m, sec_m - 1.5, stab_m, ctrl_m)
+        if score < best_score:
+            best_score = float(score)
+            best_idx = int(k)
+    reset_internal = result.transition_traj[best_idx]
+    reset_state = _paper_state_from_internal(reset_internal, control=(float(action_vec[0]), float(action_vec[1]), float(action_vec[2]))).astype(float).tolist()
+    reset_time = float(reset_internal[InternalIdx.TIME]) if reset_internal.shape[0] > InternalIdx.TIME else event_time
     calib_event = event_type
     return {
         "root_id": scene.root_id,
@@ -898,17 +910,27 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
         "x_t": _paper_state_from_internal(x_t_internal).astype(float).tolist(),
         "rho_imp": rho_imp,
         "harm_bin": int(harm_bin),
+        "reset_time": reset_time,
+        "reset_state": reset_state,
+        "degradation": deg.tolist(),
+        "reset_uncertainty_target": audit[29:32].astype(float).tolist(),
+        "recovery_world": recovery_world,
         "event_type": event_type,
         "event_time": event_time,
         "x_minus": _paper_state_from_internal(result.x_minus).astype(float).tolist(),
         "x_plus": _paper_state_from_internal(result.x_plus, control=(float(action_vec[0]), float(action_vec[1]), float(action_vec[2]))).astype(float).tolist(),
         "deg": deg.tolist(),
-        "world_plus": world_plus,
+        "world_plus": recovery_world,
         "teacher_u": teacher_u,
         "teacher_traj": teacher_traj,
         "m_star": m_star.tolist(),
         "b_star": int(np.argmin(m_star)),
         "s_star": float(np.min(m_star)),
+        "audit": {
+            "event_type": event_type,
+            "event_side": result.collision_side,
+            "notes": "diagnostic only",
+        },
         "audit_mech": {
             "event_type": event_type,
             "contact_side": result.collision_side,

@@ -1,9 +1,9 @@
 [project]
 name = "mrvp-pytorch"
 version = "0.1.0"
-description = "PyTorch implementation of Mechanism-Sufficient Recovery Viability Planning"
+description = "PyTorch implementation of MRVP: Motion-Reset Viability Programming"
 requires-python = ">=3.9"
 dependencies = ["torch>=2.1", "numpy>=1.23", "pandas>=1.5", "tqdm>=4.65", "PyYAML>=6.0"]
 
 [tool.setuptools]
-packages = ["mrvp", "mrvp.data", "mrvp.models", "mrvp.training", "mrvp.carla", "mrvp.public_pretraining", "mrvp.utils"]
+packages = ["mrvp", "mrvp.data", "mrvp.models", "mrvp.training", "mrvp.dynamics", "mrvp.safety", "mrvp.teachers", "mrvp.carla", "mrvp.public_pretraining", "mrvp.utils"]

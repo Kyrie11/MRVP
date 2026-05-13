@@ -18,9 +18,9 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from mrvp.data.dataset import MRVPDataset, mrvp_collate
-from mrvp.data.schema import NUM_ACTIONS, TOKEN_COUNT, TOKEN_DIM, SchemaDims
+from mrvp.data.schema import NUM_ACTIONS, RESET_SLOT_COUNT, RESET_SLOT_DIM, SchemaDims
 from mrvp.models.common import make_mlp
-from mrvp.models.msrt import MSRT
+from mrvp.models.cmrt import CounterfactualMotionResetTokenizer
 from mrvp.training.checkpoints import load_model
 from mrvp.training.loops import to_device
 
@@ -97,13 +97,13 @@ def build_features(
     data_path: str,
     split: str,
     feature_source: str,
-    msrt: MSRT | None,
+    cmrt: CounterfactualMotionResetTokenizer | None,
     device: torch.device,
     batch_size: int,
-    token_count: int = TOKEN_COUNT,
-    token_dim: int = TOKEN_DIM,
+    reset_slot_count: int = RESET_SLOT_COUNT,
+    reset_slot_dim: int = RESET_SLOT_DIM,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    dims = SchemaDims(token_count=token_count, token_dim=token_dim)
+    dims = SchemaDims(reset_slot_count=reset_slot_count, reset_slot_dim=reset_slot_dim)
     ds = MRVPDataset(data_path, split=split, dims=dims)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=mrvp_collate)
     x0_parts = []
@@ -111,25 +111,25 @@ def build_features(
     y_rec_parts = []
     y_b_parts = []
     for batch in tqdm(loader, desc=f"features {split}", leave=False):
-        if feature_source == "predicted_msrt":
-            if msrt is None:
-                raise ValueError("--feature-source predicted_msrt requires --msrt")
+        if feature_source == "predicted_cmrt":
+            if cmrt is None:
+                raise ValueError("--feature-source predicted_cmrt requires --cmrt")
             mb = to_device(batch, device)
-            pred = msrt.sample(mb, num_samples=1, deterministic=True)
-            x_plus = pred["x_plus"].detach().cpu()
-            d_deg = pred["d_deg"].detach().cpu()
-            event_tokens = pred["event_tokens"].detach().cpu()
-            world_plus = pred["world_plus"].detach().cpu()
+            pred = cmrt.sample_reset_problems(mb, num_samples=1, deterministic=True)
+            reset_state = pred["reset_state"].detach().cpu()
+            degradation = pred["degradation"].detach().cpu()
+            reset_slots = pred["reset_slots"].detach().cpu()
+            recovery_world = pred["recovery_world_vec"].detach().cpu()
         else:
-            x_plus = batch["x_plus"].float()
-            d_deg = batch["d_deg"].float()
-            event_tokens = batch["event_tokens"].float()
-            world_plus = batch["world_plus"].float()
+            reset_state = batch["reset_state"].float()
+            degradation = batch["degradation"].float()
+            reset_slots = batch["reset_slots"].float()
+            recovery_world = batch["recovery_world_vec"].float()
         h_ctx = batch["h_ctx"].float()
         aid = batch["action_id"].long().clamp_min(0) % NUM_ACTIONS
         action_onehot = F.one_hot(aid, NUM_ACTIONS).float()
         action_feat = torch.cat([batch["action_vec"].float(), action_onehot], dim=-1)
-        x0 = torch.cat([x_plus, d_deg, event_tokens.flatten(1), world_plus, h_ctx], dim=-1)
+        x0 = torch.cat([reset_state, degradation, reset_slots.flatten(1), recovery_world, h_ctx], dim=-1)
         x1 = torch.cat([x0, action_feat], dim=-1)
         x0_parts.append(x0.numpy())
         x1_parts.append(x1.numpy())
@@ -246,14 +246,14 @@ def train_probe(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Residual-action sufficiency diagnostic. Probe0 sees (x_plus,deg,event_tokens,world_plus,h_ctx); "
-            "Probe1 additionally sees action_vec and action_id one-hot. A small Probe1-Probe0 gain supports event-token/world sufficiency."
+            "Residual-action sufficiency diagnostic. Probe0 sees (reset_state,degradation,reset_slots,recovery_world,h_ctx); "
+            "Probe1 additionally sees action_vec and action_id one-hot. A small Probe1-Probe0 gain supports CMRT reset-problem sufficiency."
         )
     )
     parser.add_argument("--data", required=True)
     parser.add_argument("--output", default="runs/default/residual_action_diagnostic.json")
-    parser.add_argument("--feature-source", choices=["true", "predicted_msrt"], default="true")
-    parser.add_argument("--msrt", default="")
+    parser.add_argument("--feature-source", choices=["true_reset_problem", "predicted_cmrt"], default="true_reset_problem")
+    parser.add_argument("--cmrt", default="")
     parser.add_argument("--target", choices=["recoverable", "bottleneck"], default="recoverable")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -262,25 +262,33 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--msrt-hidden-dim", type=int, default=256)
+    parser.add_argument("--cmrt-hidden-dim", type=int, default=256)
     parser.add_argument("--mixture-count", type=int, default=5)
-    parser.add_argument("--token-count", type=int, default=TOKEN_COUNT)
-    parser.add_argument("--token-dim", type=int, default=TOKEN_DIM)
+    parser.add_argument("--reset-slot-count", type=int, default=RESET_SLOT_COUNT)
+    parser.add_argument("--reset-slot-dim", type=int, default=RESET_SLOT_DIM)
+    parser.add_argument("--token-count", dest="reset_slot_count", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--token-dim", dest="reset_slot_dim", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--msrt", dest="cmrt", default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     torch.set_num_threads(max(1, args.torch_threads))
     device = auto_device(args.device)
-    msrt = None
-    if args.feature_source == "predicted_msrt":
-        if not args.msrt:
-            raise SystemExit("--feature-source predicted_msrt requires --msrt")
-        msrt = MSRT(hidden_dim=args.msrt_hidden_dim, mixture_count=args.mixture_count, token_count=args.token_count, token_dim=args.token_dim).to(device)
-        load_model(msrt, args.msrt, device, strict=False)
-        msrt.eval()
+    cmrt = None
+    if args.feature_source == "predicted_cmrt":
+        if not args.cmrt:
+            raise SystemExit("--feature-source predicted_cmrt requires --cmrt")
+        cmrt = CounterfactualMotionResetTokenizer(
+            hidden_dim=args.cmrt_hidden_dim,
+            mixture_count=args.mixture_count,
+            reset_slot_count=args.reset_slot_count,
+            reset_slot_dim=args.reset_slot_dim,
+        ).to(device)
+        load_model(cmrt, args.cmrt, device, strict=False)
+        cmrt.eval()
 
-    x0_train, x1_train, y_rec_train, y_b_train = build_features(args.data, "train", args.feature_source, msrt, device, args.batch_size, args.token_count, args.token_dim)
-    x0_val, x1_val, y_rec_val, y_b_val = build_features(args.data, "val", args.feature_source, msrt, device, args.batch_size, args.token_count, args.token_dim)
-    x0_test, x1_test, y_rec_test, y_b_test = build_features(args.data, "test", args.feature_source, msrt, device, args.batch_size, args.token_count, args.token_dim)
+    x0_train, x1_train, y_rec_train, y_b_train = build_features(args.data, "train", args.feature_source, cmrt, device, args.batch_size, args.reset_slot_count, args.reset_slot_dim)
+    x0_val, x1_val, y_rec_val, y_b_val = build_features(args.data, "val", args.feature_source, cmrt, device, args.batch_size, args.reset_slot_count, args.reset_slot_dim)
+    x0_test, x1_test, y_rec_test, y_b_test = build_features(args.data, "test", args.feature_source, cmrt, device, args.batch_size, args.reset_slot_count, args.reset_slot_dim)
 
     y_train, y_val, y_test = (y_rec_train, y_rec_val, y_rec_test) if args.target == "recoverable" else (y_b_train, y_b_val, y_b_test)
     x0_train_s, x0_val_s, x0_test_s, stats0 = standardize(x0_train, x0_val, x0_test)
@@ -303,9 +311,9 @@ def main() -> None:
         "feature_source": args.feature_source,
         "target": args.target,
         "interpretation": {
-            "probe0_input": "x_plus,deg,event_tokens,world_plus,h_ctx",
-            "probe1_input": "x_plus,deg,event_tokens,world_plus,h_ctx,action_vec,action_id_onehot",
-            "rule_of_thumb": "Small or negative Probe1-Probe0 gain supports mechanism sufficiency; a large positive gain indicates residual action shortcut/leakage.",
+            "probe0_input": "reset_state,degradation,reset_slots,recovery_world,h_ctx",
+            "probe1_input": "reset_state,degradation,reset_slots,recovery_world,h_ctx,action_vec,action_id_onehot",
+            "rule_of_thumb": "Small or negative Probe1-Probe0 gain supports CMRT reset-problem sufficiency; a large positive gain indicates residual action shortcut or missing reset information.",
         },
         "probe0_no_action": {"val": probe0["val"], "test": probe0["test"]},
         "probe1_with_action": {"val": probe1["val"], "test": probe1["test"]},

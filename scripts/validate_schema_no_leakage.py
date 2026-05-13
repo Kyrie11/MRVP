@@ -13,11 +13,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mrvp.data.dataset import iter_jsonl
-from mrvp.data.schema import SchemaDims, audit_vector_from_row, ensure_tokens, validate_row_no_leakage
+from mrvp.data.schema import SchemaDims, audit_vector_from_row, ensure_slots, validate_row_no_leakage
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Validate MRVP JSONL schema for token/world leakage.")
+    ap = argparse.ArgumentParser(description="Validate MRVP reset schema for reset-slot/recovery-world label leakage.")
     ap.add_argument("--data", required=True)
     ap.add_argument("--output", default=None)
     ap.add_argument("--fail-on-leakage", action="store_true")
@@ -25,19 +25,22 @@ def main() -> None:
 
     dims = SchemaDims()
     rows = 0
-    missing_event_tokens = 0
+    missing_reset_slots = 0
+    legacy_event_tokens_rows = 0
     audit_token_fallback_rows = 0
-    world_contains_target_rows = 0
+    recovery_world_contains_target_rows = 0
     leakage_rows = 0
     warnings_by_type: Dict[str, int] = {}
 
     for row in iter_jsonl(args.data):
         rows += 1
-        token_source = row.get("event_tokens", row.get("tokens", row.get("z_tokens", None)))
-        if token_source is None:
-            missing_event_tokens += 1
-        else:
-            tok = ensure_tokens(token_source, dims.token_count, dims.token_dim).reshape(-1)
+        reset_slot_source = row.get("reset_slots", row.get("reset_slots_target"))
+        if reset_slot_source is None:
+            missing_reset_slots += 1
+        legacy_token_source = row.get("event_tokens", row.get("tokens", row.get("z_tokens", None)))
+        if legacy_token_source is not None:
+            legacy_event_tokens_rows += 1
+            tok = ensure_slots(legacy_token_source, dims.reset_slot_count, dims.reset_slot_dim).reshape(-1)
             audit = audit_vector_from_row(row, dims)
             n = min(tok.size, audit.size)
             if n and np.allclose(tok[:n], audit[:n], atol=1e-6, rtol=1e-6):
@@ -47,18 +50,19 @@ def main() -> None:
             leakage_rows += 1
             for w in warns:
                 warnings_by_type[w] = warnings_by_type.get(w, 0) + 1
-                if w.startswith("world_plus_contains"):
-                    world_contains_target_rows += 1
+                if w.startswith("recovery_world_contains"):
+                    recovery_world_contains_target_rows += 1
                     break
 
     report: Dict[str, Any] = {
         "rows": rows,
         "leakage_rows": leakage_rows,
-        "missing_event_tokens": missing_event_tokens,
+        "missing_reset_slots": missing_reset_slots,
+        "legacy_event_tokens_rows": legacy_event_tokens_rows,
         "audit_token_fallback_rows": audit_token_fallback_rows,
-        "world_contains_target_rows": world_contains_target_rows,
+        "recovery_world_contains_target_rows": recovery_world_contains_target_rows,
         "warnings_by_type": warnings_by_type,
-        "fatal": bool(audit_token_fallback_rows > 0 or world_contains_target_rows > 0),
+        "fatal": bool(audit_token_fallback_rows > 0 or recovery_world_contains_target_rows > 0),
     }
     text = json.dumps(report, indent=2, ensure_ascii=False)
     print(text)

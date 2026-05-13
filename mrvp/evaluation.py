@@ -142,8 +142,8 @@ def evaluate_selected_indices(
     """Evaluate a selector after it has already chosen one action per root.
 
     ``selected_indices`` must contain global row indices in ``rows``. This is
-    used for Predicted-MRVP where a root-level selector samples MSRT and applies
-    CVaR, so the decision cannot be represented faithfully as one deterministic
+    used for Predicted-MRVP where a root-level selector samples CMRT reset problems and applies
+    lower-tail CVaR, so the decision cannot be represented faithfully as one deterministic
     lower-bound profile per action. Optional ``scores`` still allow pair-order
     diagnostics; optional ``lower_bounds`` allows coverage/active-bottleneck
     diagnostics based on mean predicted lower profiles.

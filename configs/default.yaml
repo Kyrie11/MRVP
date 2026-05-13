@@ -1,87 +1,57 @@
-# MRVP default hyperparameters for the revised event-token / strategy-branch code path.
-scenario_generation:
-  number_of_root_scenarios: 1000
-  actions_per_root: 8
-  backend: auto              # auto -> MetaDrive if installed, else light2d fallback
-  shift_test: true           # harder friction/density/damage for held-out roots
-  action_duration_s: 1.0
-  action_library:
-    - hard_brake
-    - brake_left
-    - brake_right
-    - maintain
-    - mild_left
-    - mild_right
-    - boundary_side_steer
-    - corridor_side_steer
-
-schema:
-  state_layout: [p_x, p_y, psi, v_x, v_y, yaw_rate, a_x, a_y, beta, delta, F_b, F_x]
-  control_layout: [delta, F_b, F_x]
-  event_types: [none, contact, boundary, stability, control]
-  preferred_fields: [root_id, action_id, o_hist, h_ctx, x_t, rho_imp, harm_bin, event_type, event_time, x_minus, x_plus, deg, world_plus, teacher_u, teacher_traj, m_star, audit_mech]
-  legacy_aliases:
-    d_deg: deg
-    z_mech: audit_mech
-    r_star: m_star
-
-harm_gate:
-  harm_surrogate: impulse_or_delta_v
-  bin_thresholds: [0.5, 2.0, 4.0, 7.0, 11.0]
-
-msrt:
-  module: ActionConditionedRecoveryEventTokenizer
-  mixture_count: 5
-  hidden_dim: 256
-  token_count: 16
-  token_dim: 32       # compact default; increase with hidden_dim for larger paper-scale runs
-  world_dim: 64
-  losses:
-    lambda_nll: 1.0
-    lambda_event: 1.0
-    lambda_token: 0.5
-    lambda_world: 0.5
-    lambda_deg: 1.0
-    lambda_probe: 0.1
-    lambda_ctr: 0.1
-    contrastive_temperature: 0.1
-    lambda_suf: 0.0   # optional action adversary for diagnostics only
-
-rpn:
-  module: PolicyConditionedRecoveryViabilityNetwork
-  hidden_dim: 256
-  strategy_count: 6
-  recovery_horizon: 30
-  losses:
-    lambda_act: 0.5
-    lambda_bd: 2.0
-    sigma_bd: 0.5
-    lambda_strat: 0.5
-    lambda_dyn: 0.05
-    lambda_ctrl: 0.05
-    lambda_xi: 0.25
-    lambda_mono: 0.0
-
-pair_mining:
-  epsilon_s: 0.25
-  margin: 0.05
-  lambda_ord: 1.0
-  max_pairs_per_root: 64
-
-calibration:
-  delta_b: 0.02
-  n_min: 20
-  hierarchy: [full, medium, coarse, global]
+model:
+  name: mrvp
+  cmrt:
+    reset_slot_count: 16
+    reset_slot_dim: 64
+    mixture_count: 5
+    prefix_horizon: 20
+    hidden_dim: 256
+  rpfn:
+    program_count: 6
+    recovery_horizon: 30
+    control_dim: 3
+    hidden_dim: 256
+    dt: 0.1
 
 selection:
-  transition_samples: 16
   beta: 0.2
-  admissible_set: min_harm_bin_within_root
+  num_reset_samples: 16
+  use_certificate_correction: false
 
-recovery_teacher:
-  horizon_steps: 30
-  control_frequency_hz: 20
+loss:
+  cmrt:
+    reset: 1.0
+    world: 0.5
+    degradation: 1.0
+    counterfactual: 0.2
+    uncertainty: 1.0
+    audit_event: 0.0
+    slot_distill: 0.0
+  rpfn:
+    execution: 0.5
+    certificate: 1.0
+    funnel: 0.2
+    order: 1.0
 
-closed_loop_future_work:
-  primary_simulator: MetaDrive
-  planned_simulator: CARLA
+data:
+  preferred_fields:
+    - root_id
+    - split
+    - family
+    - action_id
+    - action_vec
+    - o_hist
+    - h_ctx
+    - x_t
+    - rho_imp
+    - harm_bin
+    - reset_time
+    - reset_state
+    - degradation
+    - reset_uncertainty_target
+    - recovery_world
+    - teacher_u
+    - teacher_traj
+    - m_star
+    - b_star
+    - s_star

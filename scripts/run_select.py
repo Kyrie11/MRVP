@@ -7,18 +7,14 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 import argparse
 import json
-from collections import defaultdict
-from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
 
-from mrvp.calibration import load_calibration_table
+from mrvp.action_selection import select_tail_consistent_action
 from mrvp.data.dataset import MRVPDataset, mrvp_collate
-from mrvp.data.schema import TOKEN_COUNT, TOKEN_DIM, STRATEGY_COUNT, RECOVERY_HORIZON, SchemaDims
-from mrvp.models.msrt import MSRT
-from mrvp.models.rpn import RecoveryProfileNetwork
-from mrvp.selection import select_action_with_models
+from mrvp.data.schema import RECOVERY_HORIZON, PROGRAM_COUNT, RESET_SLOT_COUNT, RESET_SLOT_DIM, SchemaDims
+from mrvp.models.cmrt import CounterfactualMotionResetTokenizer
+from mrvp.models.rpfn import RecoveryProgramFunnelNetwork
 from mrvp.training.checkpoints import load_model
 
 
@@ -29,41 +25,47 @@ def auto_device(name: str) -> torch.device:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run MRVP Algorithm 1 for one root scenario from a JSONL dataset.")
+    parser = argparse.ArgumentParser(description="Run tail-consistent MRVP action selection for one root scenario.")
     parser.add_argument("--data", required=True)
     parser.add_argument("--root-id", required=True)
     parser.add_argument("--split", default=None)
-    parser.add_argument("--msrt", required=True)
-    parser.add_argument("--rpn", required=True)
-    parser.add_argument("--calibration", default="")
-    parser.add_argument("--num-samples", type=int, default=32)
+    parser.add_argument("--cmrt", required=True)
+    parser.add_argument("--rpfn", required=True)
+    parser.add_argument("--num-reset-samples", type=int, default=32)
     parser.add_argument("--beta", type=float, default=0.2)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--mixture-count", type=int, default=5)
-    parser.add_argument("--token-count", type=int, default=TOKEN_COUNT)
-    parser.add_argument("--token-dim", type=int, default=TOKEN_DIM)
-    parser.add_argument("--strategy-count", type=int, default=STRATEGY_COUNT)
+    parser.add_argument("--reset-slot-count", type=int, default=RESET_SLOT_COUNT)
+    parser.add_argument("--reset-slot-dim", type=int, default=RESET_SLOT_DIM)
+    parser.add_argument("--program-count", type=int, default=PROGRAM_COUNT)
     parser.add_argument("--recovery-horizon", type=int, default=RECOVERY_HORIZON)
-    parser.add_argument("--scalar-rpn", action="store_true")
+    parser.add_argument("--scalar-rpfn", action="store_true")
+    parser.add_argument("--calibration", default="", help="Optional legacy path; not used unless a certificate correction wrapper is provided.")
     parser.add_argument("--torch-threads", type=int, default=1)
+    # Legacy aliases.
+    parser.add_argument("--msrt", dest="cmrt", help=argparse.SUPPRESS)
+    parser.add_argument("--rpn", dest="rpfn", help=argparse.SUPPRESS)
+    parser.add_argument("--num-samples", dest="num_reset_samples", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--token-count", dest="reset_slot_count", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--token-dim", dest="reset_slot_dim", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--strategy-count", dest="program_count", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--scalar-rpn", dest="scalar_rpfn", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     torch.set_num_threads(max(1, args.torch_threads))
     device = auto_device(args.device)
-    dims = SchemaDims(token_count=args.token_count, token_dim=args.token_dim, recovery_horizon=args.recovery_horizon)
+    dims = SchemaDims(reset_slot_count=args.reset_slot_count, reset_slot_dim=args.reset_slot_dim, program_count=args.program_count, recovery_horizon=args.recovery_horizon)
     ds = MRVPDataset(args.data, split=args.split, dims=dims)
     idxs = ds.root_to_indices.get(str(args.root_id))
     if not idxs:
         raise SystemExit(f"root_id {args.root_id!r} not found in data/split")
-    root_items = [ds[i] for i in idxs]
-    root_batch = mrvp_collate(root_items)
+    root_batch = mrvp_collate([ds[i] for i in idxs])
     root_rows = [ds.rows[i] for i in idxs]
-    msrt = MSRT(mixture_count=args.mixture_count, hidden_dim=args.hidden_dim, token_count=args.token_count, token_dim=args.token_dim)
-    rpn = RecoveryProfileNetwork(hidden_dim=args.hidden_dim, token_count=args.token_count, token_dim=args.token_dim, strategy_count=args.strategy_count, recovery_horizon=args.recovery_horizon, scalar=args.scalar_rpn)
-    load_model(msrt, args.msrt, device, strict=False)
-    load_model(rpn, args.rpn, device, strict=False)
-    table = load_calibration_table(args.calibration or None)
-    sel = select_action_with_models(root_batch, root_rows, msrt, rpn, table, num_samples=args.num_samples, beta=args.beta, device=device)
+    cmrt = CounterfactualMotionResetTokenizer(mixture_count=args.mixture_count, hidden_dim=args.hidden_dim, reset_slot_count=args.reset_slot_count, reset_slot_dim=args.reset_slot_dim)
+    rpfn = RecoveryProgramFunnelNetwork(hidden_dim=args.hidden_dim, reset_slot_count=args.reset_slot_count, reset_slot_dim=args.reset_slot_dim, program_count=args.program_count, recovery_horizon=args.recovery_horizon, scalar=args.scalar_rpfn)
+    load_model(cmrt, args.cmrt, device, strict=False)
+    load_model(rpfn, args.rpfn, device, strict=False)
+    sel = select_tail_consistent_action(root_batch, root_rows, cmrt, rpfn, num_samples=args.num_reset_samples, beta=args.beta, device=device)
     print(json.dumps(sel, indent=2, ensure_ascii=False))
 
 
