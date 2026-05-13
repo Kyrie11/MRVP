@@ -100,14 +100,30 @@ def main() -> None:
     lower_mean = np.zeros((len(ds), len(BOTTLE_NECKS)), dtype=np.float32)
     selected_lcvar: List[int] = []
     per_root: List[Dict[str, Any]] = []
+
+    selected_mean: List[int] = []
+    scores_mean = np.full((len(ds),), np.nan, dtype=np.float32)
     for root_id, indices, root_rows, root_batch in tqdm(iter_root_batches(ds), total=len(ds.root_to_indices), desc="predicted_cmrt_rpfn"):
         sel = select_tail_consistent_action(root_batch, root_rows, cmrt, rpfn, num_samples=args.num_reset_samples, beta=args.beta, device=device)
         selected_lcvar.append(indices[sel["selected_local_index"]])
+
+        # Fill scores for diagnostics
+        adm = harm_comparable_indices(root_rows)
+        best_mean_local = None
+        best_mean_score = -float("inf")
+
         for s in sel["candidate_summaries"]:
             local_i = int(s["candidate_index"])
             global_i = indices[local_i]
             scores_lcvar[global_i] = float(s["score_lcvar"])
+            scores_mean[global_i] = float(s["mean_certificate"])
             lower_mean[global_i, :] = float(s["mean_certificate"])
+
+            if local_i in adm and float(s["mean_certificate"]) > best_mean_score:
+                best_mean_score = float(s["mean_certificate"])
+                best_mean_local = local_i
+
+        selected_mean.append(indices[best_mean_local])
         adm = harm_comparable_indices(root_rows)
         teacher_local = max(adm, key=lambda i: float(root_rows[i]["s_star"])) if adm else 0
         per_root.append(
@@ -128,7 +144,7 @@ def main() -> None:
         )
 
     results["Predicted_MRVP_CMRT_RPFN_LCVaR"] = evaluate_selected_indices(ds.rows, selected_lcvar, scores=scores_lcvar, lower_bounds=lower_mean)
-    results["Predicted_MRVP_CMRT_RPFN_mean_certificate"] = evaluate_selected_indices(ds.rows, selected_lcvar, scores=scores_lcvar, lower_bounds=lower_mean)
+    results["Predicted_MRVP_CMRT_RPFN_mean_certificate"] = evaluate_selected_indices(ds.rows, selected_mean, scores=scores_mean, lower_bounds=lower_mean)
 
     for name, kind in [("Severity_only", "severity"), ("Weighted_post_impact_cost", "weighted_post_impact"), ("Teacher_oracle", "teacher_oracle")]:
         base_scores = baseline_scores(ds.rows, kind=kind)
