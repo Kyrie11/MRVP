@@ -1,8 +1,9 @@
 import numpy as np
-from mrvp.data.schema import row_to_numpy, SchemaDims
+from mrvp.data.schema import row_to_numpy, MECH_DIM
 
-def test_schema_no_audit_fallback():
-    row={'root_id':'r','action_id':0,'audit_mech':[1.0]*32,'z_mech':[1.0]*32,'x_minus':[0]*12,'x_plus':[0]*12,'m_star':[0]*5}
-    out=row_to_numpy(row,SchemaDims())
-    assert np.all(out['event_tokens']==0)
+def test_missing_event_tokens_are_zero_not_audit():
+    row={'root_id':'r','audit_mech':[1.0]*MECH_DIM,'z_mech':[1.0]*MECH_DIM,'m_star':[0,0,0,0,0],'x_plus':[0]*12,'x_minus':[0]*12,'deg':[1,1,1,0,1,0]}
+    out=row_to_numpy(row)
     assert float(out['has_event_tokens'])==0.0
+    assert np.all(out['event_tokens']==0.0)
+    assert out['z_mech'].sum()>0

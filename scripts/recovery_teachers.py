@@ -1,10 +1,32 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
 import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
-import json,argparse
+
+import argparse
+import json
 from pathlib import Path
-def main():
-    p=argparse.ArgumentParser(); p.add_argument('--transition',required=True); p.add_argument('--labels',required=True); p.add_argument('--output',required=True); p.add_argument('--teacher',default='heuristic'); p.add_argument('--horizon',type=float,default=5.0); args=p.parse_args(); out={'teacher':'placeholder','states':[],'controls':[],'r_star':[0,0,0,0,0],'m_star':[0,0,0,0,0],'b_star':0,'s_star':0.0}; Path(args.output).write_text(json.dumps(out,indent=2)); print(json.dumps({'output':args.output,'s_star':0.0,'b_star':0}))
-if __name__=='__main__': main()
+
+from mrvp.carla.recovery_teachers import degraded_mpc_teacher, heuristic_post_impact_teacher
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run MRVP recovery teacher from transition/mechanism JSON files.")
+    parser.add_argument("--transition", required=True)
+    parser.add_argument("--labels", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--teacher", choices=["degraded_mpc", "heuristic"], default="degraded_mpc")
+    parser.add_argument("--horizon", type=float, default=5.0)
+    args = parser.parse_args()
+    trans = json.loads(Path(args.transition).read_text(encoding="utf-8"))
+    labels = json.loads(Path(args.labels).read_text(encoding="utf-8"))
+    fn = degraded_mpc_teacher if args.teacher == "degraded_mpc" else heuristic_post_impact_teacher
+    out = fn(trans["x_plus"], labels["d_deg"], labels["h_ctx"], horizon=args.horizon)
+    Path(args.output).write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(json.dumps({"output": args.output, "s_star": out["s_star"], "b_star": out["b_star"]}))
+
+
+if __name__ == "__main__":
+    main()
