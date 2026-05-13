@@ -11,6 +11,7 @@ import numpy as np
 
 from .schema import (
     ACTION_NAMES,
+    ACTION_NAME_TO_ID,
     ACTION_VECTORS,
     ACTOR_FEAT_DIM,
     CTX_DIM,
@@ -116,6 +117,35 @@ def _split_for_root(i: int, n_roots: int) -> str:
         return "cal"
     return "test"
 
+
+def _action_vec_for_scene(scene: RootScene, action_id: int) -> np.ndarray:
+    """Scene-conditioned emergency prefix used for counterfactual generation.
+
+    The library names are fixed, but two primitives in the paper are explicitly
+    root-dependent: boundary-away and corridor-seeking.  Using static left/right
+    vectors for those actions makes their label semantics depend on arbitrary
+    coordinate signs rather than the root recovery problem.
+    """
+    action_id = int(action_id) % len(ACTION_NAMES)
+    vec = ACTION_VECTORS[action_id].astype(np.float32).copy()
+    if action_id == ACTION_NAME_TO_ID.get("boundary_side_steer", 6):
+        # steer away from the closest/active boundary side
+        vec[0] = float(np.clip(-0.45 * float(scene.boundary_side), -1.0, 1.0))
+    elif action_id == ACTION_NAME_TO_ID.get("corridor_side_steer", 7):
+        # choose the side with larger short-horizon free corridor around the ego
+        left_score = scene.road_half_width - max(0.0, scene.base_y)
+        right_score = scene.road_half_width + min(0.0, scene.base_y)
+        for a in scene.actors:
+            dx = a.x - scene.base_x
+            if -3.0 <= dx <= 25.0:
+                penalty = max(0.0, 1.0 - abs(dx) / 25.0)
+                if a.y >= scene.base_y:
+                    left_score -= penalty * (a.radius + 1.0)
+                else:
+                    right_score -= penalty * (a.radius + 1.0)
+        vec[0] = 0.45 if left_score >= right_score else -0.45
+    return vec.astype(np.float32)
+
 def write_rows_streaming(
     output: str | Path,
     n_roots: int,
@@ -150,7 +180,7 @@ def write_rows_streaming(
             root_rows: List[Dict[str, Any]] = []
             for a in range(actions_per_root):
                 action_id = a % len(ACTION_NAMES)
-                action_vec = ACTION_VECTORS[action_id].astype(np.float32)
+                action_vec = _action_vec_for_scene(scene, action_id)
 
                 if selected_backend == "metadrive":
                     result = _rollout_metadrive(scene, action_vec)
@@ -734,7 +764,7 @@ def _degraded_reachability_features(scene: RootScene, x_plus: np.ndarray, deg: n
     ]
 
 
-def _recovery_world_from_reset(scene: RootScene, result: RolloutResult, deg: np.ndarray, horizon: float = 3.0, dt: float = 0.2) -> Dict[str, Any]:
+def _recovery_world_from_reset(scene: RootScene, x_reset: np.ndarray, deg: np.ndarray, horizon: float = 3.0, dt: float = 0.2) -> Dict[str, Any]:
     """Build clean post-event recovery world without teacher-label leakage.
 
     Inputs are restricted to static scene information, the post-event state
@@ -742,7 +772,7 @@ def _recovery_world_from_reset(scene: RootScene, result: RolloutResult, deg: np.
     geometry, and an action-independent degraded-control reachability summary.
     It must not read recovery trajectories, controls, or target margins.
     """
-    x_plus = result.x_plus
+    x_plus = x_reset
     t0 = float(x_plus[InternalIdx.TIME]) if x_plus.shape[0] > InternalIdx.TIME else 0.0
     road_clear_now = _road_clearance(scene, x_plus)
     sec_clear_now, nearest_actor = _min_actor_clearance(scene, x_plus)
@@ -827,8 +857,154 @@ def _event_type_from_transition(scene: RootScene, result: RolloutResult) -> str:
     return "none"
 
 
+
+
+def _transition_controls_for_prefix(action_vec: np.ndarray, n: int) -> List[Tuple[float, float, float]]:
+    steer, throttle, brake, _ = [float(x) for x in action_vec]
+    return [(steer, throttle, brake) for _ in range(max(0, n))]
+
+
+def _select_reset_boundary(scene: RootScene, result: RolloutResult, deg: np.ndarray, action_vec: np.ndarray) -> Tuple[int, np.ndarray, float]:
+    """Select reset boundary according to the paper's contact/non-contact rule.
+
+    Contact: first stabilized state after first overlap, falling back to
+    contact+0.25s.  Non-contact: maximum normalized recovery difficulty along
+    the prefix, using only pre-teacher margins.
+    """
+    traj = result.transition_traj or [result.x_plus]
+    if len(traj) == 1:
+        return 0, traj[0], float(traj[0][InternalIdx.TIME]) if traj[0].shape[0] > InternalIdx.TIME else 0.0
+
+    times = [float(st[InternalIdx.TIME]) if st.shape[0] > InternalIdx.TIME else 0.05 * k for k, st in enumerate(traj)]
+    if result.collision:
+        contact_idx = None
+        for k, st in enumerate(traj):
+            clear, _ = _min_actor_clearance(scene, st)
+            if clear < 0.0:
+                contact_idx = k
+                break
+        if contact_idx is None:
+            contact_idx = max(0, len(traj) - 1)
+        fallback_t = times[contact_idx] + 0.25
+        best_idx = min(range(contact_idx, len(traj)), key=lambda j: abs(times[j] - fallback_t))
+        stable_count = 0
+        for j in range(max(contact_idx + 2, 2), len(traj)):
+            dt1 = max(1e-3, times[j] - times[j - 1])
+            dt0 = max(1e-3, times[j - 1] - times[j - 2])
+            v_now = float(traj[j][InternalIdx.SPEED])
+            v_prev = float(traj[j - 1][InternalIdx.SPEED])
+            v_prev2 = float(traj[j - 2][InternalIdx.SPEED])
+            r_now = float(traj[j][InternalIdx.YAW_RATE])
+            r_prev = float(traj[j - 1][InternalIdx.YAW_RATE])
+            r_prev2 = float(traj[j - 2][InternalIdx.YAW_RATE])
+            acc_now = (v_now - v_prev) / dt1
+            acc_prev = (v_prev - v_prev2) / dt0
+            rdot_now = (r_now - r_prev) / dt1
+            rdot_prev = (r_prev - r_prev2) / dt0
+            if abs(acc_now - acc_prev) < 0.5 and abs(rdot_now - rdot_prev) < 0.15:
+                stable_count += 1
+                if stable_count >= 3:
+                    best_idx = j
+                    break
+            else:
+                stable_count = 0
+            if times[j] >= fallback_t:
+                best_idx = j
+                break
+        st = traj[best_idx]
+        return int(best_idx), st, float(times[best_idx])
+
+    steer_scale = float(deg[0]) if deg.size else 1.0
+    brake_scale = float(deg[1]) if deg.size > 1 else 1.0
+    friction = float(deg[4]) if deg.size > 4 else scene.friction
+    risks: List[float] = []
+    for st in traj:
+        road_m = _road_clearance(scene, st)
+        sec_m, _ = _min_actor_clearance(scene, st)
+        yaw_rate = abs(float(st[InternalIdx.YAW_RATE])) if st.shape[0] > InternalIdx.YAW_RATE else 0.0
+        beta = abs(float(st[InternalIdx.BETA])) if st.shape[0] > InternalIdx.BETA else 0.0
+        speed = abs(float(st[InternalIdx.SPEED])) if st.shape[0] > InternalIdx.SPEED else float(np.linalg.norm(st[3:5]))
+        stab_m = friction * 1.35 - 0.55 * yaw_rate - 0.50 * beta - 0.025 * speed
+        ctrl_m = min(steer_scale - abs(float(action_vec[0])), brake_scale - abs(float(action_vec[2])))
+        progress = max(0.0, float(st[InternalIdx.X] - traj[0][InternalIdx.X]))
+        goal_m = progress / max(1.0, scene.route_dx * 0.25) - 0.20
+        margins = np.asarray([road_m, stab_m, ctrl_m, sec_m - 1.0, goal_m], dtype=np.float32)
+        eps = np.asarray([0.30, 0.00, 0.05, 0.00, 0.00], dtype=np.float32)
+        sig = np.asarray([0.20, 0.10, 0.05, 0.50, 0.20], dtype=np.float32)
+        z = (eps - margins) / np.maximum(sig, 1e-6)
+        m = float(np.max(z))
+        risks.append(m + math.log(float(np.sum(np.exp(np.clip(z - m, -50, 50))))))
+    best_idx = int(np.argmax(risks))
+    st = traj[best_idx]
+    return best_idx, st, float(times[best_idx])
+
+
+def _simulate_degraded_recovery(scene: RootScene, start_state: np.ndarray, deg: np.ndarray, horizon: float = 3.0, dt: float = 0.1) -> Tuple[List[np.ndarray], List[Tuple[float, float, float]]]:
+    """Lightweight degraded teacher from the selected reset boundary.
+
+    This is intentionally independent of action id.  It exposes whether the
+    induced reset problem is recoverable under residual authority.
+    """
+    state = start_state.copy()
+    recovery: List[np.ndarray] = [state.copy()]
+    controls: List[Tuple[float, float, float]] = []
+    steering_scale = float(np.clip(deg[0] if deg.size > 0 else 1.0, 0.05, 1.0))
+    brake_scale = float(np.clip(deg[1] if deg.size > 1 else 1.0, 0.05, 1.0))
+    throttle_scale = float(np.clip(deg[2] if deg.size > 2 else 1.0, 0.05, 1.0))
+    delay = float(np.clip(deg[3] if deg.size > 3 else 0.0, 0.0, 0.5))
+    friction = float(np.clip(deg[4] if deg.size > 4 else scene.friction, 0.2, 1.2))
+    delay_steps = int(round(delay / dt))
+    delayed_steer: List[float] = [0.0] * max(1, delay_steps + 1)
+    rec_steps = max(1, int(round(horizon / dt)))
+    # choose a target that trades centerline recovery against route/refuge progress
+    target_y = float(np.clip(scene.route_dy, -0.35 * scene.lane_width, 0.35 * scene.lane_width))
+    for _ in range(rec_steps):
+        y_err = float(state[InternalIdx.Y] - target_y)
+        yaw = float(state[InternalIdx.YAW])
+        speed = float(state[InternalIdx.SPEED])
+        beta = float(state[InternalIdx.BETA]) if state.shape[0] > InternalIdx.BETA else 0.0
+        steer_des = np.clip(-0.36 * y_err - 1.05 * yaw - 0.12 * beta, -1.0, 1.0)
+        steer_cmd = float(np.clip(steer_des, -steering_scale, steering_scale))
+        delayed_steer.append(steer_cmd)
+        steer_apply = delayed_steer.pop(0)
+        target_speed = min(9.0, max(2.5, scene.base_speed * (0.45 + 0.20 * friction)))
+        brake_cmd = float(np.clip((speed - target_speed) / 6.5 + 0.12 * abs(yaw) + 0.05 * abs(y_err), 0.0, brake_scale))
+        throttle_cmd = 0.0 if brake_cmd > 0.04 else float(np.clip((target_speed - speed) / 9.0, 0.0, 0.30 * throttle_scale))
+        state = _advance_bicycle(state, steer_apply, throttle_cmd, brake_cmd, friction, dt)
+        controls.append((steer_apply, throttle_cmd, brake_cmd))
+        recovery.append(state.copy())
+    return recovery, controls
+
+
+def _margins_from_recovery(scene: RootScene, reset_state: np.ndarray, recovery: Sequence[np.ndarray], controls: Sequence[Tuple[float, float, float]], deg: np.ndarray) -> np.ndarray:
+    traj = list(recovery) if recovery else [reset_state]
+    road_margins = np.asarray([_road_clearance(scene, s) for s in traj], dtype=np.float32)
+    sec_margins: List[float] = []
+    stab_margins: List[float] = []
+    ctrl_margins: List[float] = []
+    steering_scale = float(np.clip(deg[0] if deg.size > 0 else 1.0, 0.05, 1.0))
+    brake_scale = float(np.clip(deg[1] if deg.size > 1 else 1.0, 0.05, 1.0))
+    friction = float(np.clip(deg[4] if deg.size > 4 else scene.friction, 0.2, 1.2))
+    delay = float(np.clip(deg[3] if deg.size > 3 else 0.0, 0.0, 0.5))
+    for k, st in enumerate(traj):
+        clear, _ = _min_actor_clearance(scene, st)
+        sec_margins.append(float(clear - 0.8))
+        stab_margins.append(float(friction * 1.35 - 0.55 * abs(float(st[InternalIdx.YAW_RATE])) - 0.50 * abs(float(st[InternalIdx.BETA])) - 0.025 * float(st[InternalIdx.SPEED])))
+        if k < len(controls):
+            steer_cmd, _, brake_cmd = controls[k]
+            ctrl_margins.append(float(min(steering_scale - abs(steer_cmd), brake_scale - brake_cmd) - 0.20 * delay))
+    if not ctrl_margins:
+        ctrl_margins = [float(min(steering_scale, brake_scale) - 0.20 * delay)]
+    final = traj[-1]
+    return_center = 0.35 * scene.lane_width - abs(float(final[InternalIdx.Y]) - float(np.clip(scene.route_dy, -0.35 * scene.lane_width, 0.35 * scene.lane_width)))
+    return_heading = 0.40 - abs(_wrap_angle(float(final[InternalIdx.YAW])))
+    progress = max(0.0, float(final[InternalIdx.X] - reset_state[InternalIdx.X]))
+    return_progress = progress / max(1.0, scene.route_dx * 0.25) - 0.20
+    goal_m = min(return_center, return_heading, return_progress, float(np.min(road_margins)) + 0.3, float(np.min(sec_margins)) + 0.2)
+    return np.asarray([float(np.min(sec_margins)), float(np.min(road_margins)), float(np.min(stab_margins)), float(np.min(ctrl_margins)), float(goal_m)], dtype=np.float32)
+
 def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, harm_thresholds: Sequence[float]) -> Dict[str, Any]:
-    action_vec = ACTION_VECTORS[action_id % len(ACTION_VECTORS)].astype(np.float32)
+    action_vec = _action_vec_for_scene(scene, action_id)
     steering_scale = max(0.20, 1.0 - 0.12 * scene.damage_class)
     brake_scale = max(0.25, 1.0 - 0.10 * scene.damage_class)
     throttle_scale = max(0.30, 1.0 - 0.07 * scene.damage_class)
@@ -867,35 +1043,23 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
     audit[24:29] = [steering_scale, brake_scale, delay, scene.friction, scene.damage_class / 4.0]
     audit[29:32] = [0.04 + 0.10 * scene.actor_density, 0.05 + 0.18 * float(result.collision), scene.actor_density]
 
-    m_star = _margins_from_rollout(scene, result)
     rho_imp = float(result.rho_imp)
     harm_bin = harm_bin_from_rho(rho_imp, harm_thresholds)
     event_type = _event_type_from_transition(scene, result)
     event_time = float(result.x_plus[9]) if result.x_plus.shape[0] > 9 else float(action_vec[3])
-    x_t_internal = _state_vec(scene.base_x, scene.base_y, scene.base_yaw, scene.base_speed, 0.0, 0.0, 0.0, 0.0)
-    # Convert rollout controls from (steer, throttle, brake) to paper order
-    # (delta, F_b, F_x).
-    teacher_u = [[float(c[0]), float(c[2]), float(c[1])] for c in result.recovery_controls]
-    teacher_traj = _paper_traj_from_internal(result.recovery_traj, result.recovery_controls)
-    recovery_world = _recovery_world_from_reset(scene, result, deg)
-    # Lightweight reset boundary: choose the prefix state with the smallest
-    # hand-computed recovery margin instead of always using the prefix end.
-    best_idx = len(result.transition_traj) - 1
-    best_score = float("inf")
-    for k, st in enumerate(result.transition_traj):
-        road_m = _road_clearance(scene, st)
-        sec_m, _ = _min_actor_clearance(scene, st)
-        yaw_rate = abs(float(st[InternalIdx.YAW_RATE])) if st.shape[0] > InternalIdx.YAW_RATE else 0.0
-        beta = abs(float(st[InternalIdx.BETA])) if st.shape[0] > InternalIdx.BETA else 0.0
-        stab_m = 1.4 * scene.friction - 0.55 * yaw_rate - 0.35 * beta
-        ctrl_m = min(steering_scale, brake_scale) - 0.35
-        score = min(road_m, sec_m - 1.5, stab_m, ctrl_m)
-        if score < best_score:
-            best_score = float(score)
-            best_idx = int(k)
-    reset_internal = result.transition_traj[best_idx]
+    x_t_internal = result.x_minus if result.x_minus is not None else _state_vec(scene.base_x, scene.base_y, scene.base_yaw, scene.base_speed, 0.0, 0.0, 0.0, 0.0)
+
+    # Reset boundary is the point where recovery reasoning starts; all labels
+    # below must be built from this same state to avoid target incoherence.
+    reset_idx, reset_internal, reset_time = _select_reset_boundary(scene, result, deg, action_vec)
+    recovery_traj, recovery_controls = _simulate_degraded_recovery(scene, reset_internal, deg, horizon=3.0, dt=0.1)
+    m_star = _margins_from_recovery(scene, reset_internal, recovery_traj, recovery_controls, deg)
+    teacher_u = [[float(c[0]), float(c[2]), float(c[1])] for c in recovery_controls]
+    teacher_traj = _paper_traj_from_internal(recovery_traj, recovery_controls)
+    recovery_world = _recovery_world_from_reset(scene, reset_internal, deg)
     reset_state = _paper_state_from_internal(reset_internal, control=(float(action_vec[0]), float(action_vec[1]), float(action_vec[2]))).astype(float).tolist()
-    reset_time = float(reset_internal[InternalIdx.TIME]) if reset_internal.shape[0] > InternalIdx.TIME else event_time
+    prefix_controls = _transition_controls_for_prefix(action_vec, len(result.transition_traj))
+    prefix_rollout = _paper_traj_from_internal(result.transition_traj, prefix_controls)
     calib_event = event_type
     return {
         "root_id": scene.root_id,
@@ -908,6 +1072,7 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
         "o_hist": _history_from_scene(scene).tolist(),
         "h_ctx": _context_from_scene(scene).tolist(),
         "x_t": _paper_state_from_internal(x_t_internal).astype(float).tolist(),
+        "prefix_rollout": prefix_rollout,
         "rho_imp": rho_imp,
         "harm_bin": int(harm_bin),
         "reset_time": reset_time,
@@ -939,6 +1104,7 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
             "overlap_clearance": float(result.overlap_clearance),
             "relative_heading": float(audit[9]),
             "relative_speed": float(result.rho_imp),
+            "reset_index": int(reset_idx),
             "reset": reset.astype(float).tolist(),
             "affordance": audit[18:24].astype(float).tolist(),
             "degradation": audit[24:29].astype(float).tolist(),
@@ -1011,7 +1177,7 @@ def make_metadrive_rows(
         root_rows: List[Dict[str, Any]] = []
         for a in range(actions_per_root):
             action_id = a % len(ACTION_NAMES)
-            action_vec = ACTION_VECTORS[action_id].astype(np.float32)
+            action_vec = _action_vec_for_scene(scene, action_id)
             if selected_backend == "metadrive":
                 result = _rollout_metadrive(scene, action_vec)
             elif selected_backend == "light2d":

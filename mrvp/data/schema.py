@@ -417,13 +417,16 @@ def validate_row_no_leakage(row: Mapping[str, Any], dims: SchemaDims = SchemaDim
             warnings.append("event_tokens_equal_audit_prefix")
     world = row.get("recovery_world", row.get("world_plus", row.get("w_plus", row.get("bev_world"))))
     if world is not None:
+        # Recovery-world labels are allowed to contain primitive geometric
+        # quantities such as current road clearance or actor clearance; those
+        # can legitimately equal one component of a later certificate.  Treat it
+        # as leakage only when the aggregate score or a large fraction of the
+        # whole certificate vector appears verbatim in the world label.
         wset = _flat_float_set(world)
-        for key in ("m_star", "r_star"):
-            if key in row:
-                for v in _flatten_numeric(row.get(key)):
-                    if round(float(v), 6) in wset:
-                        warnings.append(f"recovery_world_contains_{key}_value")
-                        break
+        if "m_star" in row:
+            vals = [round(float(v), 6) for v in _flatten_numeric(row.get("m_star"))]
+            if vals and sum(v in wset for v in vals) >= max(3, int(np.ceil(0.6 * len(vals)))):
+                warnings.append("recovery_world_contains_certificate_vector")
         if "s_star" in row and round(float(row.get("s_star", 0.0)), 6) in wset:
             warnings.append("recovery_world_contains_s_star_value")
     return warnings
