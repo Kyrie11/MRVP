@@ -17,7 +17,6 @@ from mrvp.calibration import load_calibration_table, lower_bounds_for_rows, pred
 from mrvp.data.dataset import MRVPDataset
 from mrvp.data.schema import TOKEN_COUNT, TOKEN_DIM, STRATEGY_COUNT, RECOVERY_HORIZON, SchemaDims
 from mrvp.evaluation import baseline_scores, evaluate_selection, lower_bounds_from_scalar_scores
-from mrvp.models.rpn import RecoveryProfileNetwork
 from mrvp.models.baselines import DirectActionRiskNetwork, UnstructuredLatentRiskNetwork
 from mrvp.training.checkpoints import load_model
 

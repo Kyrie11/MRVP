@@ -14,7 +14,6 @@ import torch
 from mrvp.calibration import fit_calibration_table, predict_rpn, save_calibration_table
 from mrvp.data.dataset import MRVPDataset
 from mrvp.data.schema import TOKEN_COUNT, TOKEN_DIM, STRATEGY_COUNT, RECOVERY_HORIZON, SchemaDims
-from mrvp.models.rpn import RecoveryProfileNetwork
 from mrvp.models.baselines import DirectActionRiskNetwork, UnstructuredLatentRiskNetwork
 from mrvp.training.checkpoints import load_model
 
