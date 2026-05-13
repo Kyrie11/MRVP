@@ -205,7 +205,13 @@ class MSRT(nn.Module):
         trans_nll = mixture_diag_gaussian_nll(batch["x_plus"].float(), out["mix_logits"], out["mix_mean"], out["mix_log_scale"]).mean()
         event_loss = F.cross_entropy(out["event_logits"], batch["event_type_id"].long().clamp(0, len(EVENT_TYPES) - 1))
         event_time_loss = F.smooth_l1_loss(out["event_time"], batch["event_time"].float())
-        token_loss = F.smooth_l1_loss(out["event_tokens"], batch["event_tokens"].float())
+        has_tokens = batch.get("has_event_tokens")
+        if has_tokens is not None and torch.as_tensor(has_tokens).float().sum() > 0:
+            mask = torch.as_tensor(has_tokens, device=out["event_tokens"].device).float().view(-1, 1, 1)
+            denom = mask.sum().clamp_min(1.0)
+            token_loss = (F.smooth_l1_loss(out["event_tokens"], batch["event_tokens"].float(), reduction="none") * mask).sum() / denom
+        else:
+            token_loss = torch.tensor(0.0, device=trans_nll.device)
         world_loss = F.smooth_l1_loss(out["world_plus"], batch["world_plus"].float())
         deg_loss = F.smooth_l1_loss(out["d_deg"], batch["d_deg"].float())
         audit_loss = F.smooth_l1_loss(out["z_mech"], batch["z_mech"].float())
@@ -221,7 +227,7 @@ class MSRT(nn.Module):
         total = (
             lambdas.get("nll", 1.0) * trans_nll
             + lambdas.get("event", 1.0) * (event_loss + 0.2 * event_time_loss)
-            + lambdas.get("token", 0.5) * token_loss
+            + lambdas.get("token", 0.0) * token_loss
             + lambdas.get("world", 0.5) * world_loss
             + lambdas.get("deg", 1.0) * deg_loss
             + lambdas.get("probe", 0.1) * audit_loss

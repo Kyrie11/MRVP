@@ -169,6 +169,17 @@ python scripts/generate_metadrive.py \
   --seed 13
 ```
 
+对生成的数据集质量检测：
+
+```bash
+python scripts/diagnose_metadrive_dataset_quality.py \
+  --data data/metadrive_mrvp_clean.jsonl \
+  --out runs/metadrive_mrvp/dataset_quality_report.json \
+  --eps-s 0.25 \
+  --expected-actions 8
+```
+
+
 生成器流程：
 
 ```text

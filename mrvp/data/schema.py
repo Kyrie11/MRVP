@@ -331,6 +331,41 @@ def audit_vector_from_row(row: Mapping[str, Any], dims: SchemaDims = SchemaDims(
     return z
 
 
+def _flat_float_set(value: Any, precision: int = 6) -> set[float]:
+    vals = _flatten_numeric(value)
+    return {round(float(x), precision) for x in vals.reshape(-1)}
+
+
+def validate_row_no_leakage(row: Mapping[str, Any], dims: SchemaDims = SchemaDims()) -> List[str]:
+    """Return schema-level leakage warnings for one raw JSON row.
+
+    The checks are intentionally conservative.  They catch the failure modes that
+    invalidate the MRVP claim: audit vectors masquerading as learned tokens and
+    recovery-label values being copied into ``world_plus``.  A warning means the
+    row should be inspected; it is not always a proof of leakage.
+    """
+    warnings: List[str] = []
+    token_source = row.get("event_tokens", row.get("tokens", row.get("z_tokens", None)))
+    if token_source is not None:
+        tok = ensure_tokens(token_source, dims.token_count, dims.token_dim).reshape(-1)
+        audit = audit_vector_from_row(row, dims)
+        n = min(tok.size, audit.size)
+        if n and np.allclose(tok[:n], audit[:n], atol=1e-6, rtol=1e-6):
+            warnings.append("event_tokens_equal_audit_prefix")
+    world = row.get("world_plus", row.get("w_plus", row.get("bev_world")))
+    if world is not None:
+        wset = _flat_float_set(world)
+        for key in ("m_star", "r_star"):
+            if key in row:
+                for v in _flatten_numeric(row.get(key)):
+                    if round(float(v), 6) in wset:
+                        warnings.append(f"world_plus_contains_{key}_value")
+                        break
+        if "s_star" in row and round(float(row.get("s_star", 0.0)), 6) in wset:
+            warnings.append("world_plus_contains_s_star_value")
+    return warnings
+
+
 def group_dict_to_key(group: Mapping[str, Any] | None, level: str = "full") -> str:
     """Calibration grouping hierarchy from the paper appendix."""
     if not group:
@@ -369,8 +404,7 @@ def row_to_numpy(row: Mapping[str, Any], dims: SchemaDims = SchemaDims()) -> Dic
     deg = ensure_vector(row.get("deg", row.get("d_deg")), dims.deg_dim, keys=DEG_KEYS)
     audit = audit_vector_from_row(row, dims)
     token_source = row.get("event_tokens", row.get("tokens", row.get("z_tokens", None)))
-    if token_source is None:
-        token_source = audit
+    has_event_tokens = token_source is not None
     event_name = canonical_event_type(row.get("event_type"), fallback=str(row_group(row).get("event_type", "none")))
     x_minus = ensure_vector(row.get("x_minus"), dims.state_dim, keys=STATE_KEYS)
     x_t = ensure_vector(row.get("x_t", row.get("ego_state", x_minus)), dims.state_dim, keys=STATE_KEYS)
@@ -396,8 +430,10 @@ def row_to_numpy(row: Mapping[str, Any], dims: SchemaDims = SchemaDims()) -> Dic
         "x_plus": x_plus,
         "deg": deg,
         "d_deg": deg,  # backward-compatible alias
-        "event_tokens": ensure_tokens(token_source, dims.token_count, dims.token_dim),
+        "event_tokens": ensure_tokens(token_source if has_event_tokens else None, dims.token_count, dims.token_dim),
+        "has_event_tokens": np.asarray(float(has_event_tokens), dtype=np.float32),
         "world_plus": world_plus,
+        "audit_mech": audit,
         "z_mech": audit,
         "teacher_u": teacher_u,
         "teacher_traj": teacher_traj,

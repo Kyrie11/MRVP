@@ -78,6 +78,34 @@ class RolloutResult:
     done_reason: str
 
 
+class InternalIdx:
+    X = 0
+    Y = 1
+    YAW = 2
+    VX = 3
+    VY = 4
+    SPEED = 5
+    YAW_RATE = 6
+    BETA = 7
+    STEER = 8
+    TIME = 9
+
+
+class PaperIdx:
+    X = 0
+    Y = 1
+    YAW = 2
+    VX = 3
+    VY = 4
+    YAW_RATE = 5
+    AX = 6
+    AY = 7
+    BETA = 8
+    DELTA = 9
+    FB = 10
+    FX = 11
+
+
 def _split_for_root(i: int, n_roots: int) -> str:
     frac = i / max(1, n_roots)
     if frac < 0.70:
@@ -119,6 +147,7 @@ def write_rows_streaming(
             scene = _make_root_scene(i, n_roots, rng, seed=seed, shift_test=shift_test)
             scene.root_id = f"{selected_backend}_{i:06d}"
 
+            root_rows: List[Dict[str, Any]] = []
             for a in range(actions_per_root):
                 action_id = a % len(ACTION_NAMES)
                 action_vec = ACTION_VECTORS[action_id].astype(np.float32)
@@ -132,7 +161,10 @@ def write_rows_streaming(
 
                 row = _row_from_rollout(scene, action_id, result, harm_thresholds)
                 row["backend"] = selected_backend
+                root_rows.append(row)
 
+            annotate_root_counterfactual_fields(root_rows, expected_actions=actions_per_root)
+            for row in root_rows:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 f.flush()
 
@@ -664,37 +696,142 @@ def _paper_traj_from_internal(traj: Sequence[np.ndarray], controls: Sequence[Tup
     return out
 
 
-def _world_plus_from_rollout(scene: RootScene, result: RolloutResult, r_star: np.ndarray) -> Dict[str, Any]:
-    """Compact local recovery-world labels.
+def _summarize_actor_occupancy(scene: RootScene, x_plus: np.ndarray, t: float) -> Tuple[float, float, float, float]:
+    ego_x, ego_y = float(x_plus[InternalIdx.X]), float(x_plus[InternalIdx.Y])
+    clearances: List[float] = []
+    front_count = 0
+    side_count = 0
+    for ax, ay, avx, avy, ar in _actor_positions(scene, t):
+        dx = ax - ego_x
+        dy = ay - ego_y
+        c = math.hypot(dx, dy) - (2.35 + ar)
+        clearances.append(float(c))
+        if dx > -2.0 and abs(dy) < scene.lane_width:
+            front_count += 1
+        if abs(dy) < 0.75 * scene.lane_width and abs(dx) < 12.0:
+            side_count += 1
+    if not clearances:
+        return 99.0, 99.0, 0.0, 0.0
+    return float(np.min(clearances)), float(np.mean(clearances)), float(front_count), float(side_count)
 
-    This is not a raster BEV; it is a deterministic compact vector/dict that the
-    dataset loader can flatten.  The field names match the future CARLA/BEV
-    adapter and keep the same model interface.
+
+def _degraded_reachability_features(scene: RootScene, x_plus: np.ndarray, deg: np.ndarray, horizon: float = 3.0) -> List[float]:
+    speed = float(x_plus[InternalIdx.SPEED]) if x_plus.shape[0] > InternalIdx.SPEED else float(np.linalg.norm(x_plus[3:5]))
+    steer_scale = float(deg[0]) if deg.size > 0 else max(0.20, 1.0 - 0.12 * scene.damage_class)
+    brake_scale = float(deg[1]) if deg.size > 1 else max(0.25, 1.0 - 0.10 * scene.damage_class)
+    friction = float(deg[4]) if deg.size > 4 else scene.friction
+    reachable_progress = max(0.0, speed * horizon * (0.45 + 0.35 * friction))
+    lateral_authority = max(0.0, steer_scale * friction * horizon * max(1.0, speed) * 0.18)
+    left_room = scene.road_half_width + float(x_plus[InternalIdx.Y]) - 0.95
+    right_room = scene.road_half_width - float(x_plus[InternalIdx.Y]) - 0.95
+    centerline_score = max(0.0, 1.0 - abs(float(x_plus[InternalIdx.Y])) / max(scene.road_half_width, 1e-3))
+    return [
+        float(reachable_progress),
+        float(min(lateral_authority, max(0.0, left_room))),
+        float(min(lateral_authority, max(0.0, right_room))),
+        float(centerline_score),
+        float(brake_scale * friction),
+    ]
+
+
+def _world_plus_from_post_event(scene: RootScene, result: RolloutResult, deg: np.ndarray, horizon: float = 3.0, dt: float = 0.2) -> Dict[str, Any]:
+    """Build clean post-event recovery world without teacher-label leakage.
+
+    Inputs are restricted to static scene information, the post-event state
+    ``x_plus``, current/constant-velocity actor predictions, route/refuge
+    geometry, and an action-independent degraded-control reachability summary.
+    It must not read recovery trajectories, controls, or target margins.
     """
-    traj = result.recovery_traj if result.recovery_traj else [result.x_plus]
-    road = [_road_clearance(scene, s) for s in traj]
-    sec = [_min_actor_clearance(scene, s)[0] for s in traj]
-    xs = [float(s[0]) for s in traj]
-    ys = [float(s[1]) for s in traj]
+    x_plus = result.x_plus
+    t0 = float(x_plus[InternalIdx.TIME]) if x_plus.shape[0] > InternalIdx.TIME else 0.0
+    road_clear_now = _road_clearance(scene, x_plus)
+    sec_clear_now, nearest_actor = _min_actor_clearance(scene, x_plus)
+    occ_min: List[float] = []
+    occ_mean: List[float] = []
+    front_counts: List[float] = []
+    side_counts: List[float] = []
+    for k in range(int(round(horizon / dt)) + 1):
+        mn, mean, front, side = _summarize_actor_occupancy(scene, x_plus, t0 + k * dt)
+        occ_min.append(mn)
+        occ_mean.append(mean)
+        front_counts.append(front)
+        side_counts.append(side)
+    actor_speeds = [math.hypot(a.vx, a.vy) for a in scene.actors]
+    mean_vx = float(np.mean([a.vx for a in scene.actors])) if scene.actors else 0.0
+    mean_vy = float(np.mean([a.vy for a in scene.actors])) if scene.actors else 0.0
+    max_speed = float(np.max(actor_speeds)) if actor_speeds else 0.0
+    std_speed = float(np.std(actor_speeds)) if actor_speeds else 0.0
+    nearest_dx = nearest_dy = nearest_vx = nearest_vy = 0.0
+    if nearest_actor is not None:
+        ax, ay, avx, avy, _ = nearest_actor
+        nearest_dx = float(ax - float(x_plus[InternalIdx.X]))
+        nearest_dy = float(ay - float(x_plus[InternalIdx.Y]))
+        nearest_vx = float(avx)
+        nearest_vy = float(avy)
+    route_dx_rel = float(scene.route_dx - float(x_plus[InternalIdx.X]))
+    route_dy_rel = float(scene.route_dy - float(x_plus[InternalIdx.Y]))
     return {
-        "drivable_crop": [float(np.mean(road)), float(np.min(road)), float(scene.road_half_width * 2.0), float(scene.lane_width)],
-        "future_occupancy": [float(scene.actor_density), float(np.min(sec)), float(np.mean(sec)), float(len(scene.actors))],
-        "actor_flow": [float(np.mean([a.vx for a in scene.actors]) if scene.actors else 0.0), float(np.mean([a.vy for a in scene.actors]) if scene.actors else 0.0)],
-        "reachable_mask": [float(max(0.0, scene.route_dx - abs(result.x_plus[1]))), float(np.ptp(xs) if len(xs) > 1 else 0.0), float(np.ptp(ys) if len(ys) > 1 else 0.0)],
-        "goal_mask": [float(scene.route_dx), float(scene.route_dy), float(r_star[-1])],
+        "drivable_crop": [
+            float(road_clear_now),
+            float(scene.road_half_width * 2.0),
+            float(scene.lane_width),
+            float(abs(float(x_plus[InternalIdx.Y])) / max(scene.road_half_width, 1e-3)),
+        ],
+        "future_occupancy": [
+            float(scene.actor_density),
+            float(sec_clear_now),
+            float(np.min(occ_min) if occ_min else sec_clear_now),
+            float(np.mean(occ_mean) if occ_mean else sec_clear_now),
+            float(np.max(front_counts) if front_counts else 0.0),
+            float(np.max(side_counts) if side_counts else 0.0),
+            float(len(scene.actors)),
+        ],
+        "actor_flow": [mean_vx, mean_vy, max_speed, std_speed],
+        "reachable_mask": _degraded_reachability_features(scene, x_plus, deg, horizon=horizon),
+        "goal_mask": [
+            route_dx_rel,
+            route_dy_rel,
+            float(scene.boundary_side),
+            float(route_dx_rel > 0.0),
+        ],
+        "static_obstacles": [float(scene.road_half_width), float(scene.lane_width), float(scene.weather_wetness)],
+        "dynamic_actors": [nearest_dx, nearest_dy, nearest_vx, nearest_vy],
+        "route_mask": [route_dx_rel, route_dy_rel, float(scene.route_dx), float(scene.route_dy)],
+        "refuge_mask": [route_dx_rel, route_dy_rel, float(max(0.0, road_clear_now)), float(max(0.0, sec_clear_now))],
     }
 
 
-def _event_type_from_rollout(scene: RootScene, result: RolloutResult, r_star: np.ndarray) -> str:
+def _stability_event_from_transition(scene: RootScene, result: RolloutResult) -> bool:
+    x = result.x_plus
+    yaw_rate = abs(float(x[InternalIdx.YAW_RATE])) if x.shape[0] > InternalIdx.YAW_RATE else 0.0
+    beta = abs(float(x[InternalIdx.BETA])) if x.shape[0] > InternalIdx.BETA else 0.0
+    speed = abs(float(x[InternalIdx.SPEED])) if x.shape[0] > InternalIdx.SPEED else float(np.linalg.norm(x[3:5]))
+    yaw_rate_thr = max(0.25, 0.95 * scene.friction / max(1.0, speed / 8.0))
+    beta_thr = max(0.18, 0.42 * scene.friction)
+    return yaw_rate > yaw_rate_thr or beta > beta_thr
+
+
+def _control_event_from_transition(scene: RootScene, result: RolloutResult) -> bool:
+    if scene.damage_class >= 3:
+        return True
+    steering_scale = max(0.20, 1.0 - 0.12 * scene.damage_class)
+    steer_vals = [abs(float(s[InternalIdx.STEER])) for s in result.transition_traj if s.shape[0] > InternalIdx.STEER]
+    if steer_vals and max(steer_vals) > 0.95 * steering_scale:
+        return True
+    return False
+
+
+def _event_type_from_transition(scene: RootScene, result: RolloutResult) -> str:
     if result.collision:
         return "contact"
     if result.offroad or result.min_road_clearance < 0.15:
         return "boundary"
-    if float(r_star[2]) < min(float(r_star[3]), 0.05):
+    if _stability_event_from_transition(scene, result):
         return "stability"
-    if float(r_star[3]) < 0.05:
+    if _control_event_from_transition(scene, result):
         return "control"
     return "none"
+
 
 def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, harm_thresholds: Sequence[float]) -> Dict[str, Any]:
     action_vec = ACTION_VECTORS[action_id % len(ACTION_VECTORS)].astype(np.float32)
@@ -739,14 +876,14 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
     m_star = _margins_from_rollout(scene, result)
     rho_imp = float(result.rho_imp)
     harm_bin = harm_bin_from_rho(rho_imp, harm_thresholds)
-    event_type = _event_type_from_rollout(scene, result, m_star)
+    event_type = _event_type_from_transition(scene, result)
     event_time = float(result.x_plus[9]) if result.x_plus.shape[0] > 9 else float(action_vec[3])
     x_t_internal = _state_vec(scene.base_x, scene.base_y, scene.base_yaw, scene.base_speed, 0.0, 0.0, 0.0, 0.0)
     # Convert rollout controls from (steer, throttle, brake) to paper order
     # (delta, F_b, F_x).
     teacher_u = [[float(c[0]), float(c[2]), float(c[1])] for c in result.recovery_controls]
     teacher_traj = _paper_traj_from_internal(result.recovery_traj, result.recovery_controls)
-    world_plus = _world_plus_from_rollout(scene, result, m_star)
+    world_plus = _world_plus_from_post_event(scene, result, deg)
     calib_event = event_type
     return {
         "root_id": scene.root_id,
@@ -803,6 +940,26 @@ def _row_from_rollout(scene: RootScene, action_id: int, result: RolloutResult, h
         },
     }
 
+def annotate_root_counterfactual_fields(root_rows: List[Dict[str, Any]], expected_actions: int = NUM_ACTIONS, eps_s: float = 0.25) -> None:
+    """Add root-level fields needed by same-root/same-harm MRVP diagnostics."""
+    if not root_rows:
+        return
+    harm_bins = [int(r.get("harm_bin", 0)) for r in root_rows]
+    min_harm = min(harm_bins)
+    admissible = [r for r in root_rows if int(r.get("harm_bin", 0)) == min_harm]
+    s_vals = [float(r.get("s_star", 0.0)) for r in admissible]
+    spread = float(max(s_vals) - min(s_vals)) if s_vals else 0.0
+    unique_actions = {int(r.get("action_id", -1)) for r in root_rows}
+    for r in root_rows:
+        r["root_min_harm_bin"] = int(min_harm)
+        r["is_harm_admissible"] = bool(int(r.get("harm_bin", 0)) == min_harm)
+        r["root_action_count"] = int(len(unique_actions))
+        r["root_expected_action_count"] = int(expected_actions)
+        r["root_admissible_count"] = int(len(admissible))
+        r["root_same_harm_s_spread"] = spread
+        r["root_has_informative_same_harm_pair"] = bool(len(admissible) >= 2 and spread >= eps_s)
+
+
 def make_metadrive_rows(
     n_roots: int = 240,
     actions_per_root: int = NUM_ACTIONS,
@@ -829,6 +986,7 @@ def make_metadrive_rows(
     for i in range(n_roots):
         scene = _make_root_scene(i, n_roots, rng, seed=seed, shift_test=shift_test)
         scene.root_id = f"{selected_backend}_{i:06d}"
+        root_rows: List[Dict[str, Any]] = []
         for a in range(actions_per_root):
             action_id = a % len(ACTION_NAMES)
             action_vec = ACTION_VECTORS[action_id].astype(np.float32)
@@ -840,7 +998,9 @@ def make_metadrive_rows(
                 raise ValueError(f"Unknown backend {backend!r}. Use auto, metadrive, or light2d.")
             row = _row_from_rollout(scene, action_id, result, harm_thresholds)
             row["backend"] = selected_backend
-            rows.append(row)
+            root_rows.append(row)
+        annotate_root_counterfactual_fields(root_rows, expected_actions=actions_per_root)
+        rows.extend(root_rows)
     return rows
 
 

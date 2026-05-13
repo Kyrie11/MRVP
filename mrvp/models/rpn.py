@@ -81,15 +81,8 @@ class RecoveryProfileNetwork(nn.Module):
             if tokens.dim() == 2:
                 tokens = tokens.view(tokens.shape[0], self.token_count, self.token_dim)
             return tokens
-        # Backward fallback for very old callers that pass only z_mech.
-        z = batch.get("z_mech")
-        if z is None:
-            b = batch["x_plus"].shape[0]
-            return torch.zeros(b, self.token_count, self.token_dim, device=batch["x_plus"].device)
-        flat = torch.zeros(z.shape[0], self.token_count * self.token_dim, device=z.device, dtype=z.dtype)
-        n = min(flat.shape[1], z.shape[1])
-        flat[:, :n] = z[:, :n]
-        return flat.view(z.shape[0], self.token_count, self.token_dim)
+        b = batch["x_plus"].shape[0]
+        return torch.zeros(b, self.token_count, self.token_dim, device=batch["x_plus"].device, dtype=batch["x_plus"].dtype)
 
     def encode(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         ctx = self.context_encoder(batch["o_hist"], batch["h_ctx"])
