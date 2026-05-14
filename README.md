@@ -292,3 +292,24 @@ python scripts/run_select.py \
 ## Compatibility notes
 
 `mrvp/models/msrt.py`, `mrvp/models/rpn.py`, and `mrvp/selection.py` remain as deprecated shims. They exist to keep old imports and checkpoints loadable, but the documented path uses CMRT, RPFN and tail-consistent lower-CVaR selection.
+
+
+## Dataset diagnostics
+
+```bash
+python scripts/validate_counterfactual_roots.py \
+  --data data/metadrive_mrvp.jsonl \
+  --expected-actions 8
+```
+
+```bash
+python scripts/validate_counterfactual_roots.py \
+  --data data/metadrive_mrvp.jsonl \
+  --expected-actions 8
+```
+
+```bash
+python scripts/validate_schema_no_leakage.py \
+  --data data/metadrive_mrvp.jsonl \
+  --output runs/metadrive_mrvp/schema_no_leakage.json
+```
