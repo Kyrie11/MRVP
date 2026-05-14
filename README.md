@@ -249,7 +249,7 @@ Validation checks include root-level split consistency, action count per root, `
 python scripts/generate_metadrive.py \
   --output data/metadrive_mrvp.jsonl \
   --n-roots 1000 \
-  --backend auto \
+  --backend metadrive \
   --seed 13
 
 # 2. Validate dataset construction
