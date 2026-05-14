@@ -1,0 +1,28 @@
+seed: 42
+train:
+  epochs: 1
+  batch_size: 8
+  lr: 0.0003
+  num_workers: 0
+model:
+  dim: 64
+  slot_count: 16
+  slot_dim: 64
+  num_programs: 6
+  horizon: 30
+  dt: 0.1
+  state_dim: 12
+  control_dim: 3
+  deg_dim: 8
+  world_size: 64
+rpfn:
+  use_funnel_head: true
+  use_degradation_input: true
+  use_program_rollout: true
+  use_ordering_loss: true
+  branch_selection: tail_selected
+  direct_certificate_head: false
+loss:
+  lambda_c: 1.0
+  lambda_f: 0.2
+  lambda_o: 0.1

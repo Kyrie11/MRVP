@@ -1,0 +1,8 @@
+shifts:
+  - low_friction
+  - actuator_degradation
+  - unseen_contact_side
+  - high_actor_density
+  - unseen_map_geometry
+  - occluded_secondary_hazard
+methods: [severity_only, mrvp_full]

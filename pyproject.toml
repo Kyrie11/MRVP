@@ -1,9 +1,26 @@
-[project]
-name = "mrvp-pytorch"
-version = "0.1.0"
-description = "PyTorch implementation of MRVP: Motion-Reset Viability Programming"
-requires-python = ">=3.9"
-dependencies = ["torch>=2.1", "numpy>=1.23", "pandas>=1.5", "tqdm>=4.65", "PyYAML>=6.0"]
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["mrvp", "mrvp.data", "mrvp.models", "mrvp.training", "mrvp.dynamics", "mrvp.safety", "mrvp.teachers", "mrvp.carla", "mrvp.public_pretraining", "mrvp.utils"]
+[project]
+name = "mrvp"
+version = "0.1.0"
+description = "Motion-Reset Viability Programming implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.23",
+  "pyyaml>=6.0",
+  "h5py>=3.8",
+  "pandas>=1.5",
+  "torch>=2.0",
+  "matplotlib>=3.6"
+]
+
+[project.optional-dependencies]
+sim = ["metadrive-simulator>=0.4.0", "carla>=0.9.15"]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mrvp*"]

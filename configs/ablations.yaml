@@ -1,0 +1,13 @@
+variants:
+  - mrvp_full
+  - no_harm_comparable_filtering
+  - no_action_intervention_memory
+  - no_counterfactual_slot_update
+  - no_degradation_decoder
+  - no_recovery_world_decoder
+  - no_same_root_contrastive_loss
+  - no_program_rollout
+  - no_funnel_head
+  - no_ordering_loss
+  - mean_selection
+  - worst_sample_selection

@@ -1,0 +1,30 @@
+seed: 42
+sim_source: metadrive
+num_roots: 32
+families: [SC, LHB, CI, BLE, LF, AD, OSH, NCR]
+actions_per_root: 8
+storage: hdf5
+history_steps: 5
+actors: 6
+actor_features: 8
+prefix_horizon_s: 1.0
+prefix_dt: 0.1
+recovery_horizon: 30
+recovery_dt: 0.1
+world:
+  bev_size: 64
+  channels_A: 6
+  steps_O: 15
+  channels_O: 1
+  channels_G: 3
+  channels_Y: 2
+harm:
+  type: delta_v
+  num_contact_bins: 5
+  no_contact_bin: 0
+reset:
+  epsilon_v: 0.5
+  epsilon_r: 0.15
+  K_s: 3
+  max_post_contact_wait: 0.25
+  degradation_offset: 0.2

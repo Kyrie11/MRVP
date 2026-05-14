@@ -1,0 +1,7 @@
+seed: 42
+train:
+  epochs: 1
+  batch_size: 8
+  lr: 0.0001
+  num_workers: 0
+cmrt_samples: 2

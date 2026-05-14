@@ -1,0 +1,7 @@
+selection:
+  mode: lcvar
+  M: 16
+  beta: 0.2
+  use_harm_filter: true
+metrics:
+  epsilon_c: 0.2

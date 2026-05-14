@@ -1,0 +1,31 @@
+seed: 42
+train:
+  epochs: 1
+  batch_size: 8
+  lr: 0.0003
+  num_workers: 0
+model:
+  dim: 64
+  slot_count: 16
+  slot_dim: 64
+  slot_layers: 2
+  tau_steps: 11
+  reset_state_dim: 12
+  deg_dim: 8
+  world_size: 64
+  channels_A: 6
+  steps_O: 15
+  channels_O: 1
+  channels_G: 3
+  channels_Y: 2
+loss:
+  lambda_w: 1.0
+  lambda_cf: 0.1
+  lambda_u: 0.01
+cmrt:
+  use_action_intervention_memory: true
+  use_counterfactual_slot_update: true
+  use_degradation_decoder: true
+  use_recovery_world_decoder: true
+  use_same_root_contrastive_loss: true
+  reset_feature_mode: learned_slots
