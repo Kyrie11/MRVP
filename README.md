@@ -36,7 +36,7 @@ python -m mrvp.scripts.build_metadrive_dataset \
   --config configs/dataset_metadrive.yaml \
   --output data/mrvp_cf_metadrive \
   --num-roots 10000 \
-  --families SC,LHB,CI,BLE,LF,AD,OSH,NCR \
+  --families SC,LH[mrvp_patch_proposal.diff](../../../../Download/mrvp_patch_proposal.diff)B,CI,BLE,LF,AD,OSH,NCR \
   --seed 42
 ```
 
