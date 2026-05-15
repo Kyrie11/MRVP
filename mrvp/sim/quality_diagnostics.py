@@ -18,6 +18,28 @@ def _shape(x: Any) -> list[int]:
 def _finite(x: Any) -> bool:
     return bool(np.isfinite(np.asarray(x)).all())
 
+def _row_tensors(row: dict[str, Any]) -> dict[str, Any]:
+    """Tensor fields that should exist, be finite, and match schema shapes."""
+    world = row.get("world_reset", {}) or {}
+    if not isinstance(world, dict):
+        world = {}
+    return {
+        "o_hist": row.get("o_hist"),
+        "x_t": row.get("x_t"),
+        "prefix_rollout": row.get("prefix_rollout"),
+        "prefix_controls": row.get("prefix_controls"),
+        "r_reset": row.get("r_reset"),
+        "deg": row.get("deg"),
+        "teacher_u": row.get("teacher_u"),
+        "teacher_traj": row.get("teacher_traj"),
+        "cert_star": row.get("cert_star"),
+        "world_reset.A": world.get("A"),
+         "world_reset.O": world.get("O"),
+        "world_reset.G": world.get("G"),
+        "world_reset.Y": world.get("Y"),
+    }
+
+
 def _stats(values: list[float]) -> dict[str, float]:
     if not values:
         return {"mean": 0.0, "std": 0.0, "min": 0.0, "p05": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
@@ -107,6 +129,7 @@ def diagnose_dataset(data_dir: str | Path, splits: list[str], output: str | Path
         control_abs_max: list[float] = []
         route_progress: list[float] = []
         target_types: Counter[str] = Counter()
+        split_failures: list[str] = []
 
         for root in roots:
             if not root:
@@ -130,6 +153,7 @@ def diagnose_dataset(data_dir: str | Path, splits: list[str], output: str | Path
             spreads.append(spread)
             gap_count += int(spread > epsilon_c)
             for row in root:
+                tensors = _row_tensors(row)
                 try:
                     require_row_fields(row)
                 except KeyError as exc:
@@ -168,27 +192,27 @@ def diagnose_dataset(data_dir: str | Path, splits: list[str], output: str | Path
                     if cert.size > idx:
                         cert_values[name].append(float(cert[idx]))
 
-            split_failures = []
-            if action_counts and any(c != len(expected_actions) for c in action_counts):
-                split_failures.append("wrong action count")
-            if bad_action_roots:
-                split_failures.append("wrong action ids")
-            if duplicate_action_roots:
-                split_failures.append("duplicate action ids")
-            if missing_fields:
-                split_failures.append("missing required fields")
-            if bad_shapes:
-                split_failures.append("shape mismatch")
-            if finite_bad_roots:
-                split_failures.append("non-finite tensors")
-            if teacher_fail_roots:
-                split_failures.append("teacher failure")
-            if tau_bad_roots:
-                split_failures.append("bad reset boundary")
-            if contact_bad_roots:
-                split_failures.append("bad contact fields")
-            if root_inconsistent:
-                split_failures.append("inconsistent root ids")
+        split_failures = []
+        if action_counts and any(c != len(expected_actions) for c in action_counts):
+            split_failures.append("wrong action count")
+        if bad_action_roots:
+            split_failures.append("wrong action ids")
+        if duplicate_action_roots:
+            split_failures.append("duplicate action ids")
+        if missing_fields:
+            split_failures.append("missing required fields")
+        if bad_shapes:
+            split_failures.append("shape mismatch")
+        if finite_bad_roots:
+            split_failures.append("non-finite tensors")
+        if teacher_fail_roots:
+            split_failures.append("teacher failure")
+        if tau_bad_roots:
+            split_failures.append("bad reset boundary")
+        if contact_bad_roots:
+            split_failures.append("bad contact fields")
+        if root_inconsistent:
+            split_failures.append("inconsistent root ids")
         split_summary = {
             "roots": root_count,
             "rows": row_count,

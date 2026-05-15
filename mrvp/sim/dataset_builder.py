@@ -150,6 +150,28 @@ def build_synthetic_dataset(
         family = fams[i % len(fams)]
         rows = _root_rows(f"{sim_source}_{i:06d}", family, int(seed) + i, sim_source, cfg)
         save_root_rows(all_dir / f"root_{sim_source}_{i:06d}.h5", rows)
+    # Important: raw datasets under <output>/all are often diagnosed before merge.
+    # If harm_bin stays at the placeholder value 0, every action becomes harm-comparable,
+    # which makes severity-only and recoverability comparisons invalid. Fit a temporary
+    # binner over all generated roots so diagnostics and visualization are meaningful.
+    all_files = sorted(all_dir.glob(f"root_{sim_source}_*.h5"))
+    all_rows = []
+    for f in all_files:
+        all_rows.extend(load_root_rows(f))
+    harm_cfg = cfg.get("harm", {}) or {}
+    binner = HarmBinner(
+        harm_type=str(harm_cfg.get("type", "delta_v")),
+        num_contact_bins=int(harm_cfg.get("num_contact_bins", 5)),
+        no_contact_bin=int(harm_cfg.get("no_contact_bin", 0)),
+    ).fit(
+        np.array([float(r["rho_imp"]) for r in all_rows], dtype=np.float32),
+        np.array([bool(r.get("contact", False)) for r in all_rows], dtype=bool),
+    )
+    for f in all_files:
+        rows = load_root_rows(f)
+        for row in rows:
+            row["harm_bin"] = binner.assign(float(row["rho_imp"]), bool(row.get("contact", False)))
+        save_root_rows(f, rows)
     final_indices = _existing_root_indices(all_dir, sim_source)
     meta = {
         "sim_source": sim_source,
@@ -161,6 +183,7 @@ def build_synthetic_dataset(
         "schema": "MRVP-CF",
         "action_ids": ACTION_IDS,
         "seed": int(seed),
+        "harm_binner": binner.to_dict()
     }
     write_json(out / "meta.json", meta)
     return out

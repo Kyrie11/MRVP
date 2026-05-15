@@ -31,14 +31,17 @@ def _save_root(root: list[dict], out: Path, case_no: int) -> None:
     sev = select_by_heuristic(root, "severity_only")
     rec = select_by_heuristic(root, "post_reset_scalar_risk")
 
-    fig, ax = plt.subplots(figsize=(7, 7))
+    fig, ax = plt.subplots(figsize=(8, 7))
     for row in root:
         traj = np.asarray(row["prefix_rollout"])
         action = str(row["action_id"])
-        label = f"{action} bin={int(row['harm_bin'])} C={float(row['score_star']):.2f}"
-        ax.plot(traj[:, 0], traj[:, 1], label=label)
+        is_sev = action == sev["selected_action"]
+        is_rec = action == rec["selected_action"]
+        marker = "*" if is_sev and is_rec else ("S" if is_sev else ("R" if is_rec else ""))
+        label = f"{marker}{action} bin={int(row['harm_bin'])} rho={float(row['rho_imp']):.2f} C={float(row['score_star']):.2f}"
+        ax.plot(traj[:, 0], traj[:, 1], linewidth=2.5 if (is_sev or is_rec) else 1.2, label=label)
         rr = np.asarray(row["r_reset"])
-        ax.scatter([rr[0]], [rr[1]], s=12)
+        ax.scatter([rr[0]], [rr[1]], s=45 if (is_sev or is_rec) else 14)
     ax.set_title(f"{rid}: prefixes and reset states\nseverity={sev['selected_action']} recoverability={rec['selected_action']}")
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
@@ -47,6 +50,29 @@ def _save_root(root: list[dict], out: Path, case_no: int) -> None:
     ax.legend(fontsize=6, loc="best")
     fig.tight_layout()
     fig.savefig(out / f"case_{case_no:03d}_{rid}_prefixes.png", dpi=180)
+    plt.close(fig)
+
+    # Per-action bar chart: this is the most compact visual evidence for the paper story.
+    actions = [str(r["action_id"]) for r in root]
+    rho = np.array([float(r["rho_imp"]) for r in root], dtype=float)
+    cert = np.array([float(r["score_star"]) for r in root], dtype=float)
+    bins = [int(r["harm_bin"]) for r in root]
+    xs = np.arange(len(actions))
+    fig, ax1 = plt.subplots(figsize=(10, 4))
+    ax1.bar(xs - 0.18, rho, width=0.36, label="first-impact harm rho")
+    ax1.set_ylabel("rho_imp")
+    ax2 = ax1.twinx()
+    ax2.bar(xs + 0.18, cert, width=0.36, alpha=0.55, label="teacher certificate C*")
+    ax2.set_ylabel("score_star / C*")
+    for i, b in enumerate(bins):
+        ax1.text(i, max(rho.max(), 1e-6) * 1.02, f"B{b}", ha="center", va="bottom", fontsize=8)
+    ax1.set_xticks(xs)
+    ax1.set_xticklabels(actions, rotation=35, ha="right")
+    ax1.set_title(f"{rid}: severity vs recoverability ranking")
+    ax1.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(out / f"case_{case_no:03d}_{rid}_severity_vs_recovery.png", dpi=180)
     plt.close(fig)
 
     best_row = max(root, key=lambda r: float(r["score_star"]))
