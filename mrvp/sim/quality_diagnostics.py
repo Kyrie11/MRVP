@@ -130,6 +130,8 @@ def diagnose_dataset(data_dir: str | Path, splits: list[str], output: str | Path
             spreads.append(spread)
             gap_count += int(spread > epsilon_c)
             for row in root:
+                tensors = [row["o_hist"], row["x_t"], row["prefix_rollout"], row["r_reset"], row["deg"],
+                           row["teacher_u"], row["teacher_traj"], row["cert_star"]]
                 try:
                     require_row_fields(row)
                 except KeyError as exc:
