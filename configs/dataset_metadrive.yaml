@@ -28,3 +28,17 @@ reset:
   K_s: 3
   max_post_contact_wait: 0.25
   degradation_offset: 0.2
+
+
+metadrive:
+  trigger_step: 35
+  episode_horizon: 220
+  env:
+    use_render: false
+    traffic_density: 0.35
+    random_lane_width: true
+    random_lane_num: true
+    random_agent_model: true
+    crash_vehicle_done: false
+    crash_object_done: false
+    out_of_road_done: false
