@@ -120,7 +120,7 @@ def diagnose_dataset(data_dir: str | Path, splits: list[str], output: str | Path
             root_ids = {str(row.get("root_id")) for row in root}
             if len(root_ids) != 1:
                 root_inconsistent.append(rid)
-                actions = [str(row.get("action_id")) for row in root]
+            actions = [str(row.get("action_id")) for row in root]
             if len(actions) != len(set(actions)):
                 duplicate_action_roots.append(rid)
             if set(actions) != set(expected_actions):
