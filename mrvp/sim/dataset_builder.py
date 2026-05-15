@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 from pathlib import Path
 from typing import Iterable
@@ -102,48 +101,21 @@ def _root_rows(root_id: str, family: str, seed: int, sim_source: str, cfg: dict)
         rows.append(row)
     return rows
 
-def _existing_root_indices(all_dir: Path, sim_source: str) -> list[int]:
-    pattern = re.compile(rf"^root_{re.escape(sim_source)}_(\d{{6}})\.h5$")
-    indices: list[int] = []
-    for path in all_dir.glob(f"root_{sim_source}_*.h5"):
-        match = pattern.match(path.name)
-        if match:
-            indices.append(int(match.group(1)))
-    return sorted(indices)
 
-
-def build_synthetic_dataset(output: str | Path, num_roots: int, families: Iterable[str], seed: int,
-                            sim_source: str, cfg: dict, *, append:bool = False, target_total: bool = False) -> Path:
+def build_synthetic_dataset(output: str | Path, num_roots: int, families: Iterable[str], seed: int, sim_source: str, cfg: dict) -> Path:
     out = Path(output)
-    all_dir = out / "all"
-    if out.exists() and not append:
+    if out.exists():
         shutil.rmtree(out)
+    all_dir = out / "all"
     all_dir.mkdir(parents=True, exist_ok=True)
-    existing = _existing_root_indices(all_dir, sim_source) if append else []
-    start_idx = (max(existing) + 1) if existing else 0
-    roots_to_write = max(0, int(num_roots) - len(existing)) if target_total else int(num_roots)
-
     fams = list(families)
     if not fams:
         fams = SCENARIO_FAMILIES
-    for offset in range(roots_to_write):
-        i = start_idx + offset
+    for i in range(int(num_roots)):
         family = fams[i % len(fams)]
         rows = _root_rows(f"{sim_source}_{i:06d}", family, int(seed) + i, sim_source, cfg)
         save_root_rows(all_dir / f"root_{sim_source}_{i:06d}.h5", rows)
-    final_indices = _existing_root_indices(all_dir, sim_source)
-    meta = {
-        "sim_source": sim_source,
-        "num_roots": len(final_indices),
-        "num_roots_written_this_run": roots_to_write,
-        "append": bool(append),
-        "target_total": bool(target_total),
-        "families": fams,
-        "schema": "MRVP-CF",
-        "action_ids": ACTION_IDS,
-        "seed": int(seed),
-        }
-
+    meta = {"sim_source": sim_source, "num_roots": int(num_roots), "families": fams, "schema": "MRVP-CF", "action_ids": ACTION_IDS}
     write_json(out / "meta.json", meta)
     return out
 
